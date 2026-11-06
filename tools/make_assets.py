@@ -1,16 +1,24 @@
 """Generate livearea PNGs for the Gleep Remote VPK. Pure stdlib."""
-import struct, zlib, os
+import struct, zlib, os, random
 
 def write_png(path, w, h, pixel):
     def chunk(tag, data):
         c = struct.pack('>I', len(data)) + tag + data
         return c + struct.pack('>I', zlib.crc32(tag + data) & 0xffffffff)
-    raw = b''
+
+    # Build one flat byte row per scanline: filter byte 0 + RGB triplets
+    raw = bytearray()
     for y in range(h):
-        raw += b'\x00' + bytes(pixel(x, y) for x in range(w))
+        raw.append(0)  # PNG filter type: none
+        for x in range(w):
+            r, g, b = pixel(x, y)
+            raw.append(r & 0xff)
+            raw.append(g & 0xff)
+            raw.append(b & 0xff)
+
     png = (b'\x89PNG\r\n\x1a\n'
            + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
-           + chunk(b'IDAT', zlib.compress(raw, 9))
+           + chunk(b'IDAT', zlib.compress(bytes(raw), 9))
            + chunk(b'IEND', b''))
     with open(path, 'wb') as f:
         f.write(png)
@@ -30,7 +38,6 @@ def gleep_assets():
     write_png(os.path.join('sce_sys', 'icon0.png'), 128, 128, icon)
 
     # bg0.png 840x500: dark with red scanlines and static specks
-    import random
     rng = random.Random(1337)
     dots = {(rng.randrange(840), rng.randrange(500)) for _ in range(400)}
     def bg(x, y):
