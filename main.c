@@ -1,491 +1,346 @@
-/*
- * Gleep Remote — PS Vita client for GleepTV on PC.
- * Sends text commands over TCP (default port 8410) to the
- * RemoteServer in gleeptv.py and displays the returned status.
+/* Gleep Remote - PS Vita client for GleepTV.
+ * Sends one command per line over TCP to the PC (default port 5555).
+ * Commands sent: PAUSE PLAY STOP VOLUP VOLDN MUTE SEEKB SEEKF FULL CHUP CHDN
+ * Press START to quit.
  */
-#include <psp2/ctrl.h>
-#include <psp2/display.h>
-#include <psp2/gxm.h>
-#include <psp2/net/net.h>
-#include <psp2/net/netctl.h>
+
+#include <psp2/kernel/processmgr.h>
 #include <psp2/sysmodule.h>
+#include <psp2/ctrl.h>
 #include <psp2/touch.h>
+#include <psp2/display.h>
+#include <psp2/net/net.h>
 #include <vita2d.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
+#include <stdlib.h>
+#include "font.h"
 
-#define SCREEN_W     960
-#define SCREEN_H     544
-#define DEFAULT_PORT 8410
-#define CONFIG_PATH  "ux0:data/gleep_remote.cfg"
+#define SCREEN_W  480
+#define SCREEN_H  272
+#define PC_PORT   5555
 
 #define COL_BG     RGBA8(8, 8, 8, 255)
-#define COL_PANEL  RGBA8(26, 26, 26, 255)
-#define COL_BORDER RGBA8(255, 0, 0, 255)
-#define COL_TEXT   RGBA8(255, 255, 255, 255)
-#define COL_DIM    RGBA8(140, 140, 140, 255)
-#define COL_GREEN  RGBA8(0, 255, 0, 255)
-#define COL_RED    RGBA8(255, 60, 60, 255)
-#define COL_LCD    RGBA8(0, 48, 0, 255)
-#define COL_LCD_T  RGBA8(0, 255, 0, 255)
+#define COL_PANEL  RGBA8(16, 16, 16, 255)
+#define COL_RED    RGBA8(255, 0, 60, 255)
+#define COL_GREEN  RGBA8(0, 255, 120, 255)
+#define COL_BTN    RGBA8(38, 38, 38, 255)
+#define COL_TEXT   RGBA8(235, 235, 235, 255)
 
-typedef enum { SCR_REMOTE = 0, SCR_KEYPAD, SCR_CONFIG } Screen;
+enum { SCR_IP = 0, SCR_REMOTE };
 
 enum {
-    ACT_SEND = 1,
-    ACT_GOTO_REMOTE,
-    ACT_GOTO_KEYPAD,
-    ACT_GOTO_CONFIG,
-    ACT_DIGIT,
-    ACT_DOT,
-    ACT_DEL,
-    ACT_SAVE_IP,
-    ACT_ENTER_CH
+    ACT_NONE = 0,
+    ACT_PAUSE, ACT_PLAY, ACT_STOP,
+    ACT_VOLUP, ACT_VOLDN, ACT_MUTE,
+    ACT_SEEKB, ACT_SEEKF, ACT_FULL,
+    ACT_CHUP, ACT_CHDN,
+    ACT_DIGIT, ACT_DOT, ACT_DEL,
+    ACT_CONNECT, ACT_REMOTE, ACT_IPSCREEN
 };
 
 typedef struct {
     int x, y, w, h;
     const char *label;
-    const char *cmd;   /* used by ACT_SEND */
     int action;
-    char ch;           /* used by ACT_DIGIT */
+    int digit;
 } Button;
 
-/* ---------------- state ---------------- */
-static Screen screen = SCR_REMOTE;
-static char pc_ip[32] = "";
-static int  pc_port = DEFAULT_PORT;
+static char g_ip[16] = "192.168.1.";
+static int  g_screen = SCR_IP;
+static char g_status[96] = "ENTER PC IP THEN TAP CONNECT";
 
-static int  st_channel = 0, st_total = 0;
-static int  st_paused = 0, st_vhs = 1, st_tinny = 0, st_mini = 0;
-static char st_name[64] = "NO SIGNAL";
-static char last_reply[160] = "";
-static int  connected = 0;
+static int t_min_x = 0, t_min_y = 0, t_span_x = 1, t_span_y = 1;
 
-static char ip_buf[32] = "";
-static char ch_buf[8] = "";
-
-static int net_inited = 0;
-
-/* ---------------- buttons ---------------- */
-static const Button remote_btns[] = {
-    {  30, 170, 280, 90, "CH -",     "CH-",      ACT_SEND, 0 },
-    { 340, 170, 280, 90, "PAUSE",    "PAUSE",    ACT_SEND, 0 },
-    { 650, 170, 280, 90, "CH +",     "CH+",      ACT_SEND, 0 },
-    {  30, 280, 280, 90, "VHS FX",   "VHS",      ACT_SEND, 0 },
-    { 340, 280, 280, 90, "TINNY",    "TINNY",    ACT_SEND, 0 },
-    { 650, 280, 280, 90, "MINI TV",  "MINI",     ACT_SEND, 0 },
-    {  30, 390, 280, 90, "GUIDE",    "GUIDE",    ACT_SEND, 0 },
-    { 340, 390, 280, 90, "SETTINGS", "SETTINGS", ACT_SEND, 0 },
-    { 650, 390, 280, 90, "KEYPAD",   NULL,       ACT_GOTO_KEYPAD, 0 },
-    {  30, 480, 200, 44, "SETUP",    NULL,       ACT_GOTO_CONFIG, 0 },
-    { 650, 480, 200, 44, "REFRESH",  "REFRESH",  ACT_SEND, 0 },
+/* ---- IP screen: 4x3 keypad + connect/remote ---- */
+static Button ip_buttons[] = {
+    {108,  92, 60, 32, "1", ACT_DIGIT, 1},
+    {176,  92, 60, 32, "2", ACT_DIGIT, 2},
+    {244,  92, 60, 32, "3", ACT_DIGIT, 3},
+    {312,  92, 60, 32, "4", ACT_DIGIT, 4},
+    {108, 132, 60, 32, "5", ACT_DIGIT, 5},
+    {176, 132, 60, 32, "6", ACT_DIGIT, 6},
+    {244, 132, 60, 32, "7", ACT_DIGIT, 7},
+    {312, 132, 60, 32, "8", ACT_DIGIT, 8},
+    {108, 172, 60, 32, "9", ACT_DIGIT, 9},
+    {176, 172, 60, 32, "0", ACT_DIGIT, 0},
+    {244, 172, 60, 32, ".", ACT_DOT, 0},
+    {312, 172, 60, 32, "DEL", ACT_DEL, 0},
+    {116, 212, 120, 32, "CONNECT", ACT_CONNECT, 0},
+    {244, 212, 120, 32, "REMOTE", ACT_REMOTE, 0},
 };
+#define IP_BTN_COUNT ((int)(sizeof(ip_buttons) / sizeof(ip_buttons[0])))
 
-static const Button keypad_btns[] = {
-    { 180, 150, 180, 80, "1", NULL, ACT_DIGIT, '1' },
-    { 390, 150, 180, 80, "2", NULL, ACT_DIGIT, '2' },
-    { 600, 150, 180, 80, "3", NULL, ACT_DIGIT, '3' },
-    { 180, 240, 180, 80, "4", NULL, ACT_DIGIT, '4' },
-    { 390, 240, 180, 80, "5", NULL, ACT_DIGIT, '5' },
-    { 600, 240, 180, 80, "6", NULL, ACT_DIGIT, '6' },
-    { 180, 330, 180, 80, "7", NULL, ACT_DIGIT, '7' },
-    { 390, 330, 180, 80, "8", NULL, ACT_DIGIT, '8' },
-    { 600, 330, 180, 80, "9", NULL, ACT_DIGIT, '9' },
-    { 180, 420, 180, 80, "0", NULL, ACT_DIGIT, '0' },
-    { 390, 420, 180, 80, "ENTER", NULL, ACT_ENTER_CH, 0 },
-    { 600, 420, 180, 80, "BACK",  NULL, ACT_GOTO_REMOTE, 0 },
+/* ---- Remote screen: 3x4 grid ---- */
+static Button remote_buttons[] = {
+    { 63,  48, 110, 40, "PAUSE",  ACT_PAUSE, 0},
+    {185,  48, 110, 40, "PLAY",   ACT_PLAY, 0},
+    {307,  48, 110, 40, "STOP",   ACT_STOP, 0},
+    { 63,  98, 110, 40, "VOL +",  ACT_VOLUP, 0},
+    {185,  98, 110, 40, "VOL -",  ACT_VOLDN, 0},
+    {307,  98, 110, 40, "MUTE",   ACT_MUTE, 0},
+    { 63, 148, 110, 40, "SEEK <", ACT_SEEKB, 0},
+    {185, 148, 110, 40, "SEEK >", ACT_SEEKF, 0},
+    {307, 148, 110, 40, "FULL",   ACT_FULL, 0},
+    { 63, 198, 110, 40, "CH +",   ACT_CHUP, 0},
+    {185, 198, 110, 40, "CH -",   ACT_CHDN, 0},
+    {307, 198, 110, 40, "IP/SET", ACT_IPSCREEN, 0},
 };
+#define REMOTE_BTN_COUNT ((int)(sizeof(remote_buttons) / sizeof(remote_buttons[0])))
 
-static const Button config_btns[] = {
-    { 180, 150, 180, 70, "1", NULL, ACT_DIGIT, '1' },
-    { 390, 150, 180, 70, "2", NULL, ACT_DIGIT, '2' },
-    { 600, 150, 180, 70, "3", NULL, ACT_DIGIT, '3' },
-    { 180, 228, 180, 70, "4", NULL, ACT_DIGIT, '4' },
-    { 390, 228, 180, 70, "5", NULL, ACT_DIGIT, '5' },
-    { 600, 228, 180, 70, "6", NULL, ACT_DIGIT, '6' },
-    { 180, 306, 180, 70, "7", NULL, ACT_DIGIT, '7' },
-    { 390, 306, 180, 70, "8", NULL, ACT_DIGIT, '8' },
-    { 600, 306, 180, 70, "9", NULL, ACT_DIGIT, '9' },
-    { 180, 384, 180, 70, ".", NULL, ACT_DOT, 0 },
-    { 390, 384, 180, 70, "0", NULL, ACT_DIGIT, '0' },
-    { 600, 384, 180, 70, "DEL", NULL, ACT_DEL, 0 },
-    { 180, 462, 280, 60, "SAVE & CONNECT", NULL, ACT_SAVE_IP, 0 },
-    { 500, 462, 280, 60, "BACK", NULL, ACT_GOTO_REMOTE, 0 },
-};
-
-/* ---------------- networking ---------------- */
-static int parse_ipv4(const char *s, unsigned int *out)
+static void set_status(const char *msg)
 {
-    unsigned int a, b, c, d;
-    if (!s || sscanf(s, "%u.%u.%u.%u", &a, &b, &c, &d) != 4)
-        return -1;
-    if (a > 255 || b > 255 || c > 255 || d > 255)
-        return -1;
-    *out = (a << 24) | (b << 16) | (c << 8) | d; /* big-endian, as SceNet wants */
-    return 0;
+    snprintf(g_status, sizeof(g_status), "%s", msg);
 }
 
-static int init_net(void)
+static int valid_ip(const char *s)
 {
-    if (net_inited)
-        return 0;
-    if (sceSysmoduleLoadModule(SCE_SYSMODULE_NET) < 0)
-        return -1;
-    if (sceNetInit(1 * 1024 * 1024, NULL, NULL, NULL, NULL) < 0)
-        return -1;
-    sceNetCtlInit(); /* may fail if wifi is off; connect attempts will just fail */
-    net_inited = 1;
-    return 0;
+    int a, b, c, d;
+    char extra;
+    return sscanf(s, "%d.%d.%d.%d%c", &a, &b, &c, &d, &extra) == 4
+        && a >= 0 && a <= 255 && b >= 0 && b <= 255
+        && c >= 0 && c <= 255 && d >= 0 && d <= 255;
 }
 
-static int send_command(const char *cmd, char *reply, int reply_size)
+static const char *cmd_for_action(int action)
 {
-    unsigned int ip;
-    int sock, ret, total = 0;
+    switch (action) {
+    case ACT_PAUSE: return "PAUSE";
+    case ACT_PLAY:  return "PLAY";
+    case ACT_STOP:  return "STOP";
+    case ACT_VOLUP: return "VOLUP";
+    case ACT_VOLDN: return "VOLDN";
+    case ACT_MUTE:  return "MUTE";
+    case ACT_SEEKB: return "SEEKB";
+    case ACT_SEEKF: return "SEEKF";
+    case ACT_FULL:  return "FULL";
+    case ACT_CHUP:  return "CHUP";
+    case ACT_CHDN:  return "CHDN";
+    default:        return NULL;
+    }
+}
+
+static int send_command(const char *cmd)
+{
+    int sock;
     SceNetSockaddrIn addr;
-    char line[128];
-    char *nl;
+    char line[48];
 
-    reply[0] = '\0';
-    if (init_net() < 0) { snprintf(reply, reply_size, "ERR=NET_INIT"); return -1; }
-    if (parse_ipv4(pc_ip, &ip) < 0) { snprintf(reply, reply_size, "ERR=BAD_IP"); return -1; }
+    if (g_ip[0] == '\0')
+        return -1;
 
     sock = sceNetSocket("gleep", SCE_NET_AF_INET, SCE_NET_SOCK_STREAM, 0);
-    if (sock < 0) { snprintf(reply, reply_size, "ERR=SOCKET"); return -1; }
+    if (sock < 0)
+        return -1;
 
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = SCE_NET_AF_INET;
-    addr.sin_port   = sceNetHtons((unsigned short)pc_port);
-    addr.sin_addr.s_addr = ip;
-
+    addr.sin_port = sceNetHtons(PC_PORT);
+    if (sceNetInetPton(SCE_NET_AF_INET, g_ip, &addr.sin_addr) <= 0) {
+        sceNetSocketClose(sock);
+        return -1;
+    }
     if (sceNetConnect(sock, (SceNetSockaddr *)&addr, sizeof(addr)) < 0) {
-        sceNetClose(sock);
-        connected = 0;
-        snprintf(reply, reply_size, "ERR=CONNECT");
+        sceNetSocketClose(sock);
         return -1;
     }
 
     snprintf(line, sizeof(line), "%s\n", cmd);
     sceNetSend(sock, line, (unsigned int)strlen(line), 0);
-
-    while (total < reply_size - 1) {
-        ret = sceNetRecv(sock, reply + total, (unsigned int)(reply_size - 1 - total), 0);
-        if (ret <= 0)
-            break;
-        total += ret;
-        reply[total] = '\0';
-        if (strchr(reply, '\n'))
-            break;
-    }
-    nl = strchr(reply, '\n');
-    if (nl) *nl = '\0';
-    sceNetClose(sock);
-    connected = 1;
+    sceNetSocketClose(sock);
     return 0;
-}
-
-/* reply format: CH=5;TOTAL=42;NAME=ADULT SWIM;PAUSED=0;VHS=1;TINNY=0;MINI=0 */
-static void parse_status(const char *reply)
-{
-    char buf[256];
-    char *tok;
-    strncpy(buf, reply, sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = '\0';
-    tok = strtok(buf, ";");
-    while (tok) {
-        if      (!strncmp(tok, "CH=", 3))     st_channel = atoi(tok + 3);
-        else if (!strncmp(tok, "TOTAL=", 6))  st_total    = atoi(tok + 6);
-        else if (!strncmp(tok, "PAUSED=", 7)) st_paused   = atoi(tok + 7);
-        else if (!strncmp(tok, "VHS=", 4))    st_vhs      = atoi(tok + 4);
-        else if (!strncmp(tok, "TINNY=", 6)) st_tinny    = atoi(tok + 6);
-        else if (!strncmp(tok, "MINI=", 5))   st_mini     = atoi(tok + 5);
-        else if (!strncmp(tok, "NAME=", 5)) {
-            strncpy(st_name, tok + 5, sizeof(st_name) - 1);
-            st_name[sizeof(st_name) - 1] = '\0';
-        }
-        tok = strtok(NULL, ";");
-    }
-}
-
-static void quick_send(const char *cmd)
-{
-    char reply[256];
-    if (send_command(cmd, reply, sizeof(reply)) == 0 && strncmp(reply, "ERR=", 4) != 0)
-        parse_status(reply);
-    strncpy(last_reply, reply, sizeof(last_reply) - 1);
-    last_reply[sizeof(last_reply) - 1] = '\0';
-}
-
-/* ---------------- config persistence ---------------- */
-static void load_config(void)
-{
-    FILE *f = fopen(CONFIG_PATH, "r");
-    char line[64];
-    if (!f) return;
-    if (fgets(pc_ip, sizeof(pc_ip), f)) {
-        pc_ip[strcspn(pc_ip, "\r\n")] = '\0';
-        if (fgets(line, sizeof(line), f)) {
-            int p = atoi(line);
-            if (p > 0 && p < 65536) pc_port = p;
-        }
-    }
-    fclose(f);
-    if (!pc_ip[0]) screen = SCR_CONFIG;
-}
-
-static void save_config(void)
-{
-    FILE *f = fopen(CONFIG_PATH, "w");
-    if (!f) return;
-    fprintf(f, "%s\n%d\n", pc_ip, pc_port);
-    fclose(f);
-}
-
-/* ---------------- actions ---------------- */
-static void goto_config(void)
-{
-    strncpy(ip_buf, pc_ip, sizeof(ip_buf) - 1);
-    ip_buf[sizeof(ip_buf) - 1] = '\0';
-    screen = SCR_CONFIG;
 }
 
 static void do_action(const Button *b)
 {
-    char cmd[48];
+    size_t len;
+
     switch (b->action) {
-    case ACT_SEND:
-        quick_send(b->cmd);
-        break;
-    case ACT_GOTO_REMOTE:
-        screen = SCR_REMOTE;
-        break;
-    case ACT_GOTO_KEYPAD:
-        ch_buf[0] = '\0';
-        screen = SCR_KEYPAD;
-        break;
-    case ACT_GOTO_CONFIG:
-        goto_config();
-        break;
     case ACT_DIGIT:
-        if (screen == SCR_CONFIG) {
-            size_t len = strlen(ip_buf);
-            if (len < sizeof(ip_buf) - 1) { ip_buf[len] = b->ch; ip_buf[len + 1] = '\0'; }
-        } else {
-            size_t len = strlen(ch_buf);
-            if (len < sizeof(ch_buf) - 1) { ch_buf[len] = b->ch; ch_buf[len + 1] = '\0'; }
+        len = strlen(g_ip);
+        if (g_screen == SCR_IP && len < 15) {
+            g_ip[len] = (char)('0' + b->digit);
+            g_ip[len + 1] = '\0';
         }
         break;
-    case ACT_DOT: {
-        size_t len = strlen(ip_buf);
-        if (len < sizeof(ip_buf) - 1 && !strchr(ip_buf, '.')) {
-            ip_buf[len] = '.'; ip_buf[len + 1] = '\0';
+    case ACT_DOT:
+        len = strlen(g_ip);
+        if (g_screen == SCR_IP && len > 0 && len < 15 && g_ip[len - 1] != '.') {
+            g_ip[len] = '.';
+            g_ip[len + 1] = '\0';
         }
         break;
-    }
     case ACT_DEL:
-        if (screen == SCR_CONFIG) {
-            size_t len = strlen(ip_buf);
-            if (len) ip_buf[len - 1] = '\0';
-        } else {
-            size_t len = strlen(ch_buf);
-            if (len) ch_buf[len - 1] = '\0';
+        len = strlen(g_ip);
+        if (len > 0)
+            g_ip[len - 1] = '\0';
+        break;
+    case ACT_CONNECT:
+        if (!valid_ip(g_ip)) {
+            set_status("BAD IP ADDRESS");
+            break;
         }
+        g_screen = SCR_REMOTE;
+        set_status("SAVED. TAP A BUTTON TO SEND");
         break;
-    case ACT_SAVE_IP:
-        strncpy(pc_ip, ip_buf, sizeof(pc_ip) - 1);
-        pc_ip[sizeof(pc_ip) - 1] = '\0';
-        save_config();
-        screen = SCR_REMOTE
-    case ACT_SAVE_IP:
-        strncpy(pc_ip, ip_buf, sizeof(pc_pc_ip) - 1);
-        pc_ip[sizeof(pc_ip) - 1] = '\0';
-        save_config();
-        screen = SCR_REMOTE;
-        /* one-time status refresh; may block a few seconds if PC is off */
-        quick_send("PING");
+    case ACT_REMOTE:
+        g_screen = SCR_REMOTE;
         break;
-    case ACT_ENTER_CH:
-        if (ch_buf[0]) {
-            snprintf(cmd, sizeof(cmd), "CH:%s", ch_buf);
-            quick_send(cmd);
-        }
-        ch_buf[0] = '\0';
-        screen = SCR_REMOTE;
+    case ACT_IPSCREEN:
+        g_screen = SCR_IP;
+        set_status("ENTER PC IP THEN TAP CONNECT");
         break;
+    default: {
+        const char *cmd = cmd_for_action(b->action);
+        if (cmd && send_command(cmd) == 0)
+            set_status("SENT");
+        else
+            set_status("SEND FAILED - CHECK IP/PC");
+        break;
+    }
     }
 }
 
-/* ---------------- input helpers ---------------- */
-static const Button *current_buttons(int *count)
+static void handle_tap(int x, int y)
 {
-    switch (screen) {
-    case SCR_REMOTE: *count = sizeof(remote_btns) / sizeof(Button); return remote_btns;
-    case SCR_KEYPAD: *count = sizeof(keypad_btns) / sizeof(Button); return keypad_btns;
-    default:         *count = sizeof(config_btns) / sizeof(Button); return config_btns;
-    }
-}
-
-static int hit_test(const Button *btns, int n, int x, int y)
-{
+    const Button *btns = (g_screen == SCR_IP) ? ip_buttons : remote_buttons;
+    int count = (g_screen == SCR_IP) ? IP_BTN_COUNT : REMOTE_BTN_COUNT;
     int i;
-    for (i = 0; i < n; i++)
-        if (x >= btns[i].x && x < btns[i].x + btns[i].w &&
-            y >= btns[i].y && y < btns[i].y + btns[i].h)
-            return i;
-    return -1;
+
+    for (i = 0; i < count; i++) {
+        const Button *b = &btns[i];
+        if (x >= b->x && x < b->x + b->w && y >= b->y && y < b->y + b->h) {
+            do_action(b);
+            return;
+        }
+    }
 }
 
-/* ---------------- drawing ---------------- */
-static void draw_button(const Button *b, int highlight)
-{
-    unsigned int border = highlight ? COL_BORDER : COL_DIM;
-    vita2d_draw_rectangle(b->x, b->y, b->w, b->h, COL_PANEL);
-    vita2d_draw_rectangle(b->x, b->y, b->w, 2, border);
-    vita2d_draw_rectangle(b->x, b->y + b->h - 2, b->w, 2, border);
-    vita2d_draw_rectangle(b->x, b->y, 2, b->h, border);
-    vita2d_draw_rectangle(b->x + b->w - 2, b->y, 2, b->h, border);
-    draw_text(b->x + (b->w - text_width(2, b->label)) / 2,
-              b->y + (b->h - 7 * 2) / 2,
-              2, COL_TEXT, b->label);
-}
-
-static void draw_header(void)
-{
-    draw_text(30, 12, 3, COL_BORDER, "GLEEP REMOTE");
-    draw_text(560, 16, 1, COL_DIM, "TCP LINK");
-    draw_text(660, 16, 1, connected ? COL_GREEN : COL_RED,
-              connected ? "ONLINE" : "OFFLINE");
-    draw_text(30, 40, 1, COL_DIM, "PC:");
-    draw_text(70, 40, 1, COL_TEXT, pc_ip[0] ? pc_ip : "NOT SET");
-}
-
-static void draw_footer(void)
-{
-    draw_text(30, 526, 1, COL_DIM, last_reply[0] ? last_reply : "READY");
-}
-
-static void draw_remote_screen(int sel)
-{
-    int n, i;
-    const Button *btns = current_buttons(&n);
-    char line[80];
-
-    /* green LCD status panel */
-    vita2d_draw_rectangle(30, 60, 900, 95, COL_LCD);
-    vita2d_draw_rectangle(30, 60, 900, 2, COL_DIM);
-    vita2d_draw_rectangle(30, 153, 900, 2, COL_DIM);
-    snprintf(line, sizeof(line), "CH %02d / %02d   %s", st_channel, st_total, st_name);
-    draw_text(50, 72, 2, COL_LCD_T, line);
-    snprintf(line, sizeof(line), "PAUSED:%s   VHS:%s   TINNY:%s   MINI:%s",
-             st_paused ? "YES" : "NO", st_vhs ? "ON" : "OFF",
-             st_tinny ? "ON" : "OFF", st_mini ? "ON" : "OFF");
-    draw_text(50, 118, 1, COL_LCD_T, line);
-
-    for (i = 0; i < n; i++)
-        draw_button(&btns[i], i == sel);
-}
-
-static void draw_keypad_screen(int sel)
-{
-    int n, i;
-    const Button *btns = current_buttons(&n);
-    char line[32];
-    snprintf(line, sizeof(line), "CH - %s", ch_buf[0] ? ch_buf : "_");
-    draw_text((SCREEN_W - text_width(4, line)) / 2, 70, 4, COL_TEXT, line);
-    for (i = 0; i < n; i++)
-        draw_button(&btns[i], i == sel);
-}
-
-static void draw_config_screen(int sel)
-{
-    int n, i;
-    const Button *btns = current_buttons(&n);
-    char line[48];
-    snprintf(line, sizeof(line), "IP: %s", ip_buf[0] ? ip_buf : "_");
-    draw_text((SCREEN_W - text_width(3, line)) / 2, 60, 3, COL_TEXT, line);
-    draw_text(30, 120, 1, COL_DIM, "ENTER YOUR PC'S IPV4 ADDRESS, THEN SAVE");
-    for (i = 0; i < n; i++)
-        draw_button(&btns[i], i == sel);
-}
-
-/* ---------------- main ---------------- */
-int main(void)
+static void touch_calibrate(void)
 {
     SceTouchPanelInfo pinfo;
-    unsigned prev_btns = 0;
+    memset(&pinfo, 0, sizeof(pinfo));
+    sceTouchGetPanelInfo(SCE_TOUCH_PORT_FRONT, &pinfo);
+    t_min_x = (int)pinfo.minAaX;
+    t_min_y = (int)pinfo.minAaY;
+    t_span_x = (int)pinfo.maxAaX - (int)pinfo.minAaX;
+    t_span_y = (int)pinfo.maxAaY - (int)pinfo.minAaY;
+    if (t_span_x <= 0) t_span_x = 1;
+    if (t_span_y <= 0) t_span_y = 1;
+}
+
+static void touch_to_screen(int rx, int ry, int *sx, int *sy)
+{
+    *sx = (rx - t_min_x) * SCREEN_W / t_span_x;
+    *sy = (ry - t_min_y) * SCREEN_H / t_span_y;
+}
+
+static void draw_button(const Button *b)
+{
+    int tw;
+    vita2d_draw_fill_rect((float)b->x, (float)b->y, (float)b->w, (float)b->h, COL_RED);
+    vita2d_draw_fill_rect((float)b->x + 2, (float)b->y + 2,
+                          (float)b->w - 4, (float)b->h - 4, COL_BTN);
+    tw = text_width(2.0f, b->label);
+    draw_text(2.0f, b->x + (b->w - tw) / 2, b->y + (b->h - 14) / 2, COL_TEXT, b->label);
+}
+
+static void draw_ip_screen(void)
+{
+    char buf[24];
+    int tw;
+    int i;
+
+    draw_text(2.5f, 16, 24, COL_RED, "GLEEP REMOTE");
+
+    vita2d_draw_fill_rect(108, 52, 264, 30, COL_RED);
+    vita2d_draw_fill_rect(110, 54, 260, 26, COL_PANEL);
+    snprintf(buf, sizeof(buf), "%s_", g_ip);
+    tw = text_width(2.0f, buf);
+    draw_text(2.0f, 108 + (264 - tw) / 2, 60, COL_GREEN, buf);
+
+    for (i = 0; i < IP_BTN_COUNT; i++)
+        draw_button(&ip_buttons[i]);
+}
+
+static void draw_remote_screen(void)
+{
+    int i;
+    draw_text(2.5f, 16, 24, COL_RED, "GLEEP REMOTE");
+    for (i = 0; i < REMOTE_BTN_COUNT; i++)
+        draw_button(&remote_buttons[i]);
+    draw_text(1.5f, 63, 248, COL_GREEN, "TAP A BUTTON TO SEND A COMMAND");
+}
+
+static void init_net(void)
+{
+    SceNetInitParam param;
+
+    if (sceSysmoduleLoadModule(SCE_SYSMODULE_NET) < 0)
+        return;
+
+    memset(&param, 0, sizeof(param));
+    param.memory = malloc(1 * 1024 * 1024);
+    if (!param.memory)
+        return;
+    param.size = 1 * 1024 * 1024;
+    param.flags = 0;
+    sceNetInit(&param);
+}
+
+int main(void)
+{
+    SceCtrlData pad;
     int prev_touch = 0;
-    int sel = 0;
-    int t_min_x = 0, t_min_y = 0, t_span_x = 1, t_span_y = 1;
+    int last_x = 0, last_y = 0;
+
+    init_net();
 
     vita2d_init();
     vita2d_set_clear_color(COL_BG);
-    sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG);
-    sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
+    touch_calibrate();
 
-    if (sceTouchGetPanelInfo(SCE_TOUCH_PORT_FRONT, &pinfo) >= 0) {
-        t_min_x = pinfo.minA.x; t_min_y = pinfo.minA.y;
-        t_span_x = pinfo.maxA.x - pinfo.minA.x;
-        t_span_y = pinfo.maxA.y - pinfo.minA.y;
-        if (t_span_x <= 0) t_span_x = 1;
-        if (t_span_y <= 0) t_span_y = 1;
-    }
-
-    load_config();
+    memset(&pad, 0, sizeof(pad));
 
     for (;;) {
-        SceCtrlData pad;
         SceTouchData td;
-        int n, tx, ty, idx;
-        unsigned pressed;
-        const Button *btns;
-        Screen prev_screen = screen;
+        int touched = 0;
+        int tx = 0, ty = 0;
 
-        /* ---- input ---- */
         sceCtrlPeekBufferPositive(0, &pad, 1);
-        if ((pad.buttons & (SCE_CTRL_SELECT | SCE_CTRL_START)) ==
-            (SCE_CTRL_SELECT | SCE_CTRL_START))
+        if (pad.buttons & SCE_CTRL_START)
             break;
 
-        pressed = pad.buttons & ~prev_btns;
-        prev_btns = pad.buttons;
-
-        btns = current_buttons(&n);
-
-        if (pressed & SCE_CTRL_UP)    sel = (sel + n - 3) % n;
-        if (pressed & SCE_CTRL_DOWN)  sel = (sel + 3) % n;
-        if (pressed & SCE_CTRL_LEFT)  sel = (sel + n - 1) % n;
-        if (pressed & SCE_CTRL_RIGHT) sel = (sel + 1) % n;
-        if (pressed & SCE_CTRL_CROSS) do_action(&btns[sel]);
-        if (pressed & SCE_CTRL_START) goto_config();
-        if (pressed & SCE_CTRL_CIRCLE && screen != SCR_REMOTE) screen = SCR_REMOTE;
-
-        sceTouchPeek(SCE_TOUCH_PORT_FRONT, &td, 1);
-        if (td.reportNum > 0 && !prev_touch) {
-            tx = (td.report[0].x - t_min_x) * SCREEN_W / t_span_x;
-            ty = (td.report[0].y - t_min_y) * SCREEN_H / t_span_y;
-            idx = hit_test(btns, n, tx, ty);
-            if (idx >= 0) { sel = idx; do_action(&btns[idx]); }
+        memset(&td, 0, sizeof(td));
+        if (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &td, 1) > 0 && td.reportNum > 0) {
+            touched = 1;
+            touch_to_screen((int)td.report[0].x, (int)td.report[0].y, &tx, &ty);
+            last_x = tx;
+            last_y = ty;
         }
-        prev_touch = td.reportNum > 0;
 
-        if (screen != prev_screen) sel = 0;
+        /* Fire on finger release, using the last known position. */
+        if (prev_touch && !touched)
+            handle_tap(last_x, last_y);
+        prev_touch = touched;
 
-        /* ---- draw ---- */
         vita2d_start_drawing();
         vita2d_clear_screen();
-        draw_header();
-        switch (screen) {
-        case SCR_REMOTE: draw_remote_screen(sel); break;
-        case SCR_KEYPAD: draw_keypad_screen(sel); break;
-        default:          draw_config_screen(sel); break;
-        }
-        draw_footer();
+
+        if (g_screen == SCR_IP)
+            draw_ip_screen();
+        else
+            draw_remote_screen();
+
+        draw_text(1.5f, 8, 6, COL_GREEN, g_status);
+
         vita2d_end_drawing();
         vita2d_swap_buffers();
+        sceDisplayWaitVblankStart();
     }
 
     vita2d_fini();
+    sceNetTerm();
+    sceKernelExitProcess(0);
     return 0;
 }
