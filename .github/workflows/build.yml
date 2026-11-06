@@ -1,0 +1,29 @@
+name: Build Gleep Remote VPK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: vitasdk/vitasdk:latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate livearea assets
+        run: python3 tools/make_assets.py
+
+      - name: Build VPK
+        run: |
+          mkdir -p build
+          cd build
+          cmake -DCMAKE_BUILD_TYPE=Release ..
+          make -j$(nproc)
+
+      - name: Upload VPK
+        uses: actions/upload-artifact@v4
+        with:
+          name: gleep-remote-vpk
+          path: build/*.vpk
