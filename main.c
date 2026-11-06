@@ -2,6 +2,10 @@
  * Sends one command per line over TCP to the PC (default port 5555).
  * Commands sent: PAUSE PLAY STOP VOLUP VOLDN MUTE SEEKB SEEKF FULL CHUP CHDN
  * Press START to quit.
+ *
+ * Layout note: vita2d_init() creates a 960x544 framebuffer (the Vita's
+ * native screen), so the UI is laid out at 960x544. Drawing at 480x272
+ * would cram everything into the top-left quarter of the screen.
  */
 
 #include <psp2/kernel/processmgr.h>
@@ -16,9 +20,13 @@
 #include <stdlib.h>
 #include "font.h"
 
-#define SCREEN_W  480
-#define SCREEN_H  272
+#define SCREEN_W  960
+#define SCREEN_H  544
 #define PC_PORT   5555
+
+/* UI text: 4x-scaled 5x7 font = 20x28 px glyphs. */
+#define UI_TEXT_SCALE 4.0f
+#define UI_TEXT_H     28
 
 #define COL_BG     RGBA8(8, 8, 8, 255)
 #define COL_PANEL  RGBA8(16, 16, 16, 255)
@@ -54,37 +62,37 @@ static int t_min_x = 0, t_min_y = 0, t_span_x = 1, t_span_y = 1;
 
 /* ---- IP screen: 4x3 keypad + connect/remote ---- */
 static Button ip_buttons[] = {
-    {108,  92, 60, 32, "1", ACT_DIGIT, 1},
-    {176,  92, 60, 32, "2", ACT_DIGIT, 2},
-    {244,  92, 60, 32, "3", ACT_DIGIT, 3},
-    {312,  92, 60, 32, "4", ACT_DIGIT, 4},
-    {108, 132, 60, 32, "5", ACT_DIGIT, 5},
-    {176, 132, 60, 32, "6", ACT_DIGIT, 6},
-    {244, 132, 60, 32, "7", ACT_DIGIT, 7},
-    {312, 132, 60, 32, "8", ACT_DIGIT, 8},
-    {108, 172, 60, 32, "9", ACT_DIGIT, 9},
-    {176, 172, 60, 32, "0", ACT_DIGIT, 0},
-    {244, 172, 60, 32, ".", ACT_DOT, 0},
-    {312, 172, 60, 32, "DEL", ACT_DEL, 0},
-    {116, 212, 120, 32, "CONNECT", ACT_CONNECT, 0},
-    {244, 212, 120, 32, "REMOTE", ACT_REMOTE, 0},
+    {216, 184, 120, 64, "1", ACT_DIGIT, 1},
+    {352, 184, 120, 64, "2", ACT_DIGIT, 2},
+    {488, 184, 120, 64, "3", ACT_DIGIT, 3},
+    {624, 184, 120, 64, "4", ACT_DIGIT, 4},
+    {216, 264, 120, 64, "5", ACT_DIGIT, 5},
+    {352, 264, 120, 64, "6", ACT_DIGIT, 6},
+    {488, 264, 120, 64, "7", ACT_DIGIT, 7},
+    {624, 264, 120, 64, "8", ACT_DIGIT, 8},
+    {216, 344, 120, 64, "9", ACT_DIGIT, 9},
+    {352, 344, 120, 64, "0", ACT_DIGIT, 0},
+    {488, 344, 120, 64, ".", ACT_DOT, 0},
+    {624, 344, 120, 64, "DEL", ACT_DEL, 0},
+    {232, 424, 240, 64, "CONNECT", ACT_CONNECT, 0},
+    {488, 424, 240, 64, "REMOTE", ACT_REMOTE, 0},
 };
 #define IP_BTN_COUNT ((int)(sizeof(ip_buttons) / sizeof(ip_buttons[0])))
 
 /* ---- Remote screen: 3x4 grid ---- */
 static Button remote_buttons[] = {
-    { 63,  48, 110, 40, "PAUSE",  ACT_PAUSE, 0},
-    {185,  48, 110, 40, "PLAY",   ACT_PLAY, 0},
-    {307,  48, 110, 40, "STOP",   ACT_STOP, 0},
-    { 63,  98, 110, 40, "VOL +",  ACT_VOLUP, 0},
-    {185,  98, 110, 40, "VOL -",  ACT_VOLDN, 0},
-    {307,  98, 110, 40, "MUTE",   ACT_MUTE, 0},
-    { 63, 148, 110, 40, "SEEK <", ACT_SEEKB, 0},
-    {185, 148, 110, 40, "SEEK >", ACT_SEEKF, 0},
-    {307, 148, 110, 40, "FULL",   ACT_FULL, 0},
-    { 63, 198, 110, 40, "CH +",   ACT_CHUP, 0},
-    {185, 198, 110, 40, "CH -",   ACT_CHDN, 0},
-    {307, 198, 110, 40, "IP/SET", ACT_IPSCREEN, 0},
+    {126,  96, 220, 80, "PAUSE",  ACT_PAUSE, 0},
+    {370,  96, 220, 80, "PLAY",   ACT_PLAY, 0},
+    {614,  96, 220, 80, "STOP",   ACT_STOP, 0},
+    {126, 196, 220, 80, "VOL +",  ACT_VOLUP, 0},
+    {370, 196, 220, 80, "VOL -",  ACT_VOLDN, 0},
+    {614, 196, 220, 80, "MUTE",   ACT_MUTE, 0},
+    {126, 296, 220, 80, "SEEK <", ACT_SEEKB, 0},
+    {370, 296, 220, 80, "SEEK >", ACT_SEEKF, 0},
+    {614, 296, 220, 80, "FULL",   ACT_FULL, 0},
+    {126, 396, 220, 80, "CH +",   ACT_CHUP, 0},
+    {370, 396, 220, 80, "CH -",   ACT_CHDN, 0},
+    {614, 396, 220, 80, "IP/SET", ACT_IPSCREEN, 0},
 };
 #define REMOTE_BTN_COUNT ((int)(sizeof(remote_buttons) / sizeof(remote_buttons[0])))
 
@@ -239,10 +247,11 @@ static void draw_button(const Button *b)
 {
     int tw;
     vita2d_draw_rectangle((float)b->x, (float)b->y, (float)b->w, (float)b->h, COL_RED);
-    vita2d_draw_rectangle((float)b->x + 2, (float)b->y + 2,
-                          (float)b->w - 4, (float)b->h - 4, COL_BTN);
-    tw = text_width(2.0f, b->label);
-    draw_text(2.0f, b->x + (b->w - tw) / 2, b->y + (b->h - 14) / 2, COL_TEXT, b->label);
+    vita2d_draw_rectangle((float)b->x + 4, (float)b->y + 4,
+                          (float)b->w - 8, (float)b->h - 8, COL_BTN);
+    tw = text_width(UI_TEXT_SCALE, b->label);
+    draw_text(UI_TEXT_SCALE, b->x + (b->w - tw) / 2, b->y + (b->h - UI_TEXT_H) / 2,
+              COL_TEXT, b->label);
 }
 
 static void draw_ip_screen(void)
@@ -251,13 +260,13 @@ static void draw_ip_screen(void)
     int tw;
     int i;
 
-    draw_text(2.5f, 16, 24, COL_RED, "GLEEP REMOTE");
+    draw_text(5.0f, 32, 48, COL_RED, "GLEEP REMOTE");
 
-    vita2d_draw_rectangle(108, 52, 264, 30, COL_RED);
-    vita2d_draw_rectangle(110, 54, 260, 26, COL_PANEL);
+    vita2d_draw_rectangle(216, 104, 528, 60, COL_RED);
+    vita2d_draw_rectangle(220, 108, 520, 52, COL_PANEL);
     snprintf(buf, sizeof(buf), "%s_", g_ip);
-    tw = text_width(2.0f, buf);
-    draw_text(2.0f, 108 + (264 - tw) / 2, 60, COL_GREEN, buf);
+    tw = text_width(UI_TEXT_SCALE, buf);
+    draw_text(UI_TEXT_SCALE, 216 + (528 - tw) / 2, 120, COL_GREEN, buf);
 
     for (i = 0; i < IP_BTN_COUNT; i++)
         draw_button(&ip_buttons[i]);
@@ -266,10 +275,10 @@ static void draw_ip_screen(void)
 static void draw_remote_screen(void)
 {
     int i;
-    draw_text(2.5f, 16, 24, COL_RED, "GLEEP REMOTE");
+    draw_text(5.0f, 32, 48, COL_RED, "GLEEP REMOTE");
     for (i = 0; i < REMOTE_BTN_COUNT; i++)
         draw_button(&remote_buttons[i]);
-    draw_text(1.5f, 63, 248, COL_GREEN, "TAP A BUTTON TO SEND A COMMAND");
+    draw_text(3.0f, 126, 500, COL_GREEN, "TAP A BUTTON TO SEND A COMMAND");
 }
 
 static void init_net(void)
@@ -332,7 +341,7 @@ int main(void)
         else
             draw_remote_screen();
 
-        draw_text(1.5f, 8, 6, COL_GREEN, g_status);
+        draw_text(3.0f, 16, 12, COL_GREEN, g_status);
 
         vita2d_end_drawing();
         vita2d_swap_buffers();
