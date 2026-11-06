@@ -227,6 +227,13 @@ static void handle_tap(int x, int y)
 static void touch_calibrate(void)
 {
     SceTouchPanelInfo pinfo;
+
+    /* REQUIRED: the panel defaults to not sampling. Without this,
+     * sceTouchPeek never returns any reports. */
+    sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT,
+                             SCE_TOUCH_SAMPLING_STATE_START);
+    sceTouchEnableTouchForce(SCE_TOUCH_PORT_FRONT);
+
     memset(&pinfo, 0, sizeof(pinfo));
     sceTouchGetPanelInfo(SCE_TOUCH_PORT_FRONT, &pinfo);
     t_min_x = (int)pinfo.minAaX;
