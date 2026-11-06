@@ -1,4 +1,9 @@
-"""Generate livearea PNGs + template.xml for the Gleep Remote VPK. Pure stdlib."""
+"""Generate livearea PNGs + template.xml for the Gleep Remote VPK. Pure stdlib.
+
+All PNGs are written as 8-bit palette (color type 3) images, which the Vita
+requires for sce_sys graphics -- 24-bit RGB PNGs cause VitaShell install
+error 0x8010113D.
+"""
 import struct, zlib, os, random
 
 def write_png(path, w, h, pixel):
@@ -6,23 +11,40 @@ def write_png(path, w, h, pixel):
         c = struct.pack('>I', len(data)) + tag + data
         return c + struct.pack('>I', zlib.crc32(tag + data) & 0xffffffff)
 
-    # Build one flat byte row per scanline: filter byte 0 + RGB triplets
+    # First pass: build the palette and per-pixel index data.
+    # Color type 3: each pixel is a single byte indexing into PLTE.
+    palette = []        # list of (r, g, b), insertion-ordered
+    palette_index = {}  # (r, g, b) -> palette position
     raw = bytearray()
     for y in range(h):
         raw.append(0)  # PNG filter type: none
         for x in range(w):
             r, g, b = pixel(x, y)
-            raw.append(r & 0xff)
-            raw.append(g & 0xff)
-            raw.append(b & 0xff)
+            color = (r & 0xff, g & 0xff, b & 0xff)
+            idx = palette_index.get(color)
+            if idx is None:
+                if len(palette) >= 256:
+                    raise ValueError('%s: over 256 colors, cannot write '
+                                     'an 8-bit palette PNG' % path)
+                idx = len(palette)
+                palette.append(color)
+                palette_index[color] = idx
+            raw.append(idx)
+
+    plte = bytearray()
+    for r, g, b in palette:
+        plte.append(r)
+        plte.append(g)
+        plte.append(b)
 
     png = (b'\x89PNG\r\n\x1a\n'
-           + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+           + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 3, 0, 0, 0))
+           + chunk(b'PLTE', bytes(plte))
            + chunk(b'IDAT', zlib.compress(bytes(raw), 9))
            + chunk(b'IEND', b''))
     with open(path, 'wb') as f:
         f.write(png)
-    print('wrote', path)
+    print('wrote', path, '-', len(palette), 'colors')
 
 def gleep_assets():
     out = os.path.join('sce_sys', 'livearea', 'contents')
