@@ -1,4 +1,4 @@
-"""Generate livearea PNGs for the Gleep Remote VPK. Pure stdlib."""
+"""Generate livearea PNGs + template.xml for the Gleep Remote VPK. Pure stdlib."""
 import struct, zlib, os, random
 
 def write_png(path, w, h, pixel):
@@ -52,6 +52,23 @@ def gleep_assets():
             return (0, 255, 0)
         return (0, 0, 0)
     write_png(os.path.join(out, 'startup.png'), 480, 272, startup)
+
+    # template.xml: livearea layout referencing the generated images
+    template = '''<?xml version="1.0" encoding="utf-8"?>
+<livearea style="a1" format-ver="01.00" content-rev="1">
+\t<livearea-background>
+\t\t<image>bg0.png</image>
+\t</livearea-background>
+\t<frame id="frame3" multi="false" alpha="1.0">
+\t\t<liveitem>
+\t\t\t<image>startup.png</image>
+\t\t</liveitem>
+\t</frame>
+</livearea>
+'''
+    with open(os.path.join(out, 'template.xml'), 'w') as f:
+        f.write(template)
+    print('wrote', os.path.join(out, 'template.xml'))
 
 if __name__ == '__main__':
     gleep_assets()
