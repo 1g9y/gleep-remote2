@@ -1,11 +1,15 @@
 /* Gleep Remote - PS Vita client for GleepTV.
- * Sends one command per line over TCP to the PC (default port 5555).
- * Commands sent: PAUSE PLAY STOP VOLUP VOLDN MUTE SEEKB SEEKF FULL CHUP CHDN
+ * Protocol (matches GleepTV's RemoteServer on port 8410):
+ *   - Connect TCP, send one command + '\n', read one reply line.
+ *   - Commands: PAUSE CH+ CH- VHS TINNY MINI GUIDE SETTINGS REFRESH PING
+ *   - Reply:    CH=1;TOTAL=5;NAME=...;PAUSED=0;VHS=1;TINNY=0;MINI=0
+ *               or ERR=... on failure.
+ * The reply is parsed and shown on the LCD panel; PAUSE flips its label
+ * between PAUSE/PLAY based on the server's reported state.
  * Press START to quit.
  *
  * Layout note: vita2d_init() creates a 960x544 framebuffer (the Vita's
- * native screen), so the UI is laid out at 960x544. Drawing at 480x272
- * would cram everything into the top-left quarter of the screen.
+ * native screen), so the UI is laid out at 960x544.
  */
 
 #include <psp2/kernel/processmgr.h>
@@ -18,11 +22,15 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <sys/time.h>
 #include "font.h"
 
 #define SCREEN_W  960
 #define SCREEN_H  544
-#define PC_PORT   5555
+#define PC_PORT   8410          /* VITA_REMOTE_PORT in GleepTV */
+
+#define CONNECT_TIMEOUT_US (3 * 1000 * 1000)   /* 3s connect cap */
+#define IO_TIMEOUT_SEC     2                    /* 2s send/recv cap */
 
 /* UI text: 4x-scaled 5x7 font = 20x28 px glyphs. */
 #define UI_TEXT_SCALE 4.0f
@@ -38,11 +46,9 @@
 enum { SCR_IP = 0, SCR_REMOTE };
 
 enum {
-    ACT_NONE = 0,
-    ACT_PAUSE, ACT_PLAY, ACT_STOP,
-    ACT_VOLUP, ACT_VOLDN, ACT_MUTE,
-    ACT_SEEKB, ACT_SEEKF, ACT_FULL,
-    ACT_CHUP, ACT_CHDN,
+    ACT_PAUSE = 1, ACT_CHUP, ACT_CHDN,
+    ACT_VHS, ACT_TINNY, ACT_MINI,
+    ACT_GUIDE, ACT_SETTINGS, ACT_REFRESH, ACT_PING,
     ACT_DIGIT, ACT_DOT, ACT_DEL,
     ACT_CONNECT, ACT_REMOTE, ACT_IPSCREEN
 };
@@ -57,6 +63,11 @@ typedef struct {
 static char g_ip[16] = "192.168.1.";
 static int  g_screen = SCR_IP;
 static char g_status[96] = "ENTER PC IP THEN TAP CONNECT";
+
+/* Last reply from the server + parsed state for the LCD. */
+static char g_reply[128] = "";
+static int  g_ch = 0, g_total = 0, g_paused = 0;
+static char g_name[40] = "NO SIGNAL";
 
 static int t_min_x = 0, t_min_y = 0, t_span_x = 1, t_span_y = 1;
 
@@ -79,20 +90,19 @@ static Button ip_buttons[] = {
 };
 #define IP_BTN_COUNT ((int)(sizeof(ip_buttons) / sizeof(ip_buttons[0])))
 
-/* ---- Remote screen: 3x4 grid ---- */
+/* ---- Remote screen: commands the GleepTV server actually handles ---- */
 static Button remote_buttons[] = {
-    {126,  96, 220, 80, "PAUSE",  ACT_PAUSE, 0},
-    {370,  96, 220, 80, "PLAY",   ACT_PLAY, 0},
-    {614,  96, 220, 80, "STOP",   ACT_STOP, 0},
-    {126, 196, 220, 80, "VOL +",  ACT_VOLUP, 0},
-    {370, 196, 220, 80, "VOL -",  ACT_VOLDN, 0},
-    {614, 196, 220, 80, "MUTE",   ACT_MUTE, 0},
-    {126, 296, 220, 80, "SEEK <", ACT_SEEKB, 0},
-    {370, 296, 220, 80, "SEEK >", ACT_SEEKF, 0},
-    {614, 296, 220, 80, "FULL",   ACT_FULL, 0},
-    {126, 396, 220, 80, "CH +",   ACT_CHUP, 0},
-    {370, 396, 220, 80, "CH -",   ACT_CHDN, 0},
-    {614, 396, 220, 80, "IP/SET", ACT_IPSCREEN, 0},
+    {126, 200, 220, 72, "PAUSE",    ACT_PAUSE,    0},
+    {370, 200, 220, 72, "CH +",     ACT_CHUP,     0},
+    {614, 200, 220, 72, "CH -",     ACT_CHDN,     0},
+    {126, 278, 220, 72, "VHS FX",   ACT_VHS,      0},
+    {370, 278, 220, 72, "TINNY",    ACT_TINNY,    0},
+    {614, 278, 220, 72, "MINI TV",  ACT_MINI,     0},
+    {126, 356, 220, 72, "GUIDE",    ACT_GUIDE,    0},
+    {370, 356, 220, 72, "SETTINGS", ACT_SETTINGS, 0},
+    {614, 356, 220, 72, "REFRESH",  ACT_REFRESH,  0},
+    {126, 434, 340, 72, "PING TEST",ACT_PING,     0},
+    {500, 434, 340, 72, "IP/SET",   ACT_IPSCREEN, 0},
 };
 #define REMOTE_BTN_COUNT ((int)(sizeof(remote_buttons) / sizeof(remote_buttons[0])))
 
@@ -113,49 +123,163 @@ static int valid_ip(const char *s)
 static const char *cmd_for_action(int action)
 {
     switch (action) {
-    case ACT_PAUSE: return "PAUSE";
-    case ACT_PLAY:  return "PLAY";
-    case ACT_STOP:  return "STOP";
-    case ACT_VOLUP: return "VOLUP";
-    case ACT_VOLDN: return "VOLDN";
-    case ACT_MUTE:  return "MUTE";
-    case ACT_SEEKB: return "SEEKB";
-    case ACT_SEEKF: return "SEEKF";
-    case ACT_FULL:  return "FULL";
-    case ACT_CHUP:  return "CHUP";
-    case ACT_CHDN:  return "CHDN";
-    default:        return NULL;
+    case ACT_PAUSE:    return "PAUSE";
+    case ACT_CHUP:     return "CH+";
+    case ACT_CHDN:     return "CH-";
+    case ACT_VHS:      return "VHS";
+    case ACT_TINNY:    return "TINNY";
+    case ACT_MINI:     return "MINI";
+    case ACT_GUIDE:    return "GUIDE";
+    case ACT_SETTINGS: return "SETTINGS";
+    case ACT_REFRESH:  return "REFRESH";
+    case ACT_PING:     return "PING";
+    default:           return NULL;
     }
 }
 
+/* Parse "CH=1;TOTAL=5;NAME=...;PAUSED=0;..." into the LCD globals. */
+static void parse_reply(const char *r)
+{
+    const char *p;
+    const char *e;
+    size_t n;
+    int v;
+
+    if ((p = strstr(r, "CH=")) != NULL && sscanf(p + 3, "%d", &v) == 1)
+        g_ch = v;
+    if ((p = strstr(r, "TOTAL=")) != NULL && sscanf(p + 6, "%d", &v) == 1)
+        g_total = v;
+    if ((p = strstr(r, "PAUSED=")) != NULL && sscanf(p + 7, "%d", &v) == 1)
+        g_paused = v;
+    if ((p = strstr(r, "NAME=")) != NULL) {
+        p += 5;
+        e = strchr(p, ';');
+        n = e ? (size_t)(e - p) : strlen(p);
+        if (n >= sizeof(g_name))
+            n = sizeof(g_name) - 1;
+        memcpy(g_name, p, n);
+        g_name[n] = '\0';
+    }
+}
+
+/* Connect to the PC, send one command, read the one-line reply.
+ * Returns 0 and fills g_reply on any reply; -1 with an ERR=... in
+ * g_reply on failure. Never blocks longer than ~5s total. */
 static int send_command(const char *cmd)
 {
-    int sock;
+    int sock = -1, eid = -1;
     SceNetSockaddrIn addr;
+    SceNetEpollEvent ev;
+    SceNetEpollEvent out[1];
     char line[48];
+    char buf[160];
+    struct timeval tv;
+    int on = 1, off = 0;
+    int err = 0;
+    unsigned int errlen = sizeof(err);
+    int total = 0, len, ret;
 
-    if (g_ip[0] == '\0')
+    snprintf(g_reply, sizeof(g_reply), "ERR=NONE");
+
+    if (!valid_ip(g_ip)) {
+        snprintf(g_reply, sizeof(g_reply), "ERR=BAD IP");
         return -1;
+    }
 
     sock = sceNetSocket("gleep", SCE_NET_AF_INET, SCE_NET_SOCK_STREAM, 0);
-    if (sock < 0)
+    if (sock < 0) {
+        snprintf(g_reply, sizeof(g_reply), "ERR=SOCKET");
         return -1;
+    }
+
+    /* Non-blocking connect so a wrong IP can't freeze the UI. */
+    sceNetSetsockopt(sock, SCE_NET_SOL_SOCKET, SCE_NET_SO_NBIO, &on, sizeof(on));
 
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = SCE_NET_AF_INET;
     addr.sin_port = sceNetHtons(PC_PORT);
     if (sceNetInetPton(SCE_NET_AF_INET, g_ip, &addr.sin_addr) <= 0) {
-        sceNetSocketClose(sock);
-        return -1;
-    }
-    if (sceNetConnect(sock, (SceNetSockaddr *)&addr, sizeof(addr)) < 0) {
+        snprintf(g_reply, sizeof(g_reply), "ERR=BAD IP");
         sceNetSocketClose(sock);
         return -1;
     }
 
+    ret = sceNetConnect(sock, (SceNetSockaddr *)&addr, sizeof(addr));
+    if (ret < 0 && ret != SCE_NET_ERROR_EINPROGRESS) {
+        snprintf(g_reply, sizeof(g_reply), "ERR=REFUSED");
+        sceNetSocketClose(sock);
+        return -1;
+    }
+    if (ret == SCE_NET_ERROR_EINPROGRESS) {
+        memset(&ev, 0, sizeof(ev));
+        ev.events = SCE_NET_EPOLLOUT;
+        ev.data.fd = sock;
+        eid = sceNetEpollCreate("gleep", 0);
+        if (eid < 0 ||
+            sceNetEpollControl(eid, SCE_NET_EPOLL_CTL_ADD, sock, &ev) < 0) {
+            snprintf(g_reply, sizeof(g_reply), "ERR=EPOLL");
+            if (eid >= 0) sceNetEpollDestroy(eid);
+            sceNetSocketClose(sock);
+            return -1;
+        }
+        if (sceNetEpollWait(eid, out, 1, CONNECT_TIMEOUT_US) <= 0) {
+            snprintf(g_reply, sizeof(g_reply), "ERR=TIMEOUT");
+            sceNetEpollDestroy(eid);
+            sceNetSocketClose(sock);
+            return -1;
+        }
+        sceNetEpollDestroy(eid);
+        eid = -1;
+        sceNetGetsockopt(sock, SCE_NET_SOL_SOCKET, SCE_NET_SO_ERROR,
+                         &err, &errlen);
+        if (err != 0) {
+            snprintf(g_reply, sizeof(g_reply), "ERR=REFUSED");
+            sceNetSocketClose(sock);
+            return -1;
+        }
+    }
+
+    /* Back to blocking for the data phase, with hard timeouts. */
+    sceNetSetsockopt(sock, SCE_NET_SOL_SOCKET, SCE_NET_SO_NBIO, &off, sizeof(off));
+    tv.tv_sec = IO_TIMEOUT_SEC;
+    tv.tv_usec = 0;
+    sceNetSetsockopt(sock, SCE_NET_SOL_SOCKET, SCE_NET_SO_RCVTIMEO, &tv, sizeof(tv));
+    sceNetSetsockopt(sock, SCE_NET_SOL_SOCKET, SCE_NET_SO_SNDTIMEO, &tv, sizeof(tv));
+
     snprintf(line, sizeof(line), "%s\n", cmd);
-    sceNetSend(sock, line, (unsigned int)strlen(line), 0);
+    if (sceNetSend(sock, line, (unsigned int)strlen(line), 0) < 0) {
+        snprintf(g_reply, sizeof(g_reply), "ERR=SEND");
+        sceNetSocketClose(sock);
+        return -1;
+    }
+
+    /* Read one reply line (the server sends status + '\n'). */
+    memset(buf, 0, sizeof(buf));
+    while (total < (int)sizeof(buf) - 1) {
+        len = sceNetRecv(sock, buf + total,
+                         (unsigned int)(sizeof(buf) - 1 - total), 0);
+        if (len <= 0)
+            break;
+        total += len;
+        if (memchr(buf, '\n', (size_t)total))
+            break;
+    }
     sceNetSocketClose(sock);
+
+    if (total <= 0) {
+        snprintf(g_reply, sizeof(g_reply), "ERR=NO REPLY");
+        return -1;
+    }
+    buf[total] = '\0';
+    while (total > 0 && (buf[total - 1] == '\n' || buf[total - 1] == '\r'))
+        buf[--total] = '\0';
+
+    snprintf(g_reply, sizeof(g_reply), "%s", buf);
+
+    if (strncmp(buf, "ERR", 3) == 0)
+        return -1;
+
+    parse_reply(buf);
     return 0;
 }
 
@@ -189,7 +313,12 @@ static void do_action(const Button *b)
             break;
         }
         g_screen = SCR_REMOTE;
-        set_status("SAVED. TAP A BUTTON TO SEND");
+        /* PING verifies the link and fills the LCD; it has no side
+         * effects on the server. */
+        if (send_command("PING") == 0)
+            set_status("CONNECTED");
+        else
+            set_status(g_reply);
         break;
     case ACT_REMOTE:
         g_screen = SCR_REMOTE;
@@ -200,10 +329,12 @@ static void do_action(const Button *b)
         break;
     default: {
         const char *cmd = cmd_for_action(b->action);
-        if (cmd && send_command(cmd) == 0)
-            set_status("SENT");
+        if (!cmd)
+            break;
+        if (send_command(cmd) == 0)
+            set_status("OK");
         else
-            set_status("SEND FAILED - CHECK IP/PC");
+            set_status(g_reply);
         break;
     }
     }
@@ -250,15 +381,20 @@ static void touch_to_screen(int rx, int ry, int *sx, int *sy)
     *sy = (ry - t_min_y) * SCREEN_H / t_span_y;
 }
 
-static void draw_button(const Button *b)
+static void draw_button_l(const Button *b, const char *label)
 {
     int tw;
     vita2d_draw_rectangle((float)b->x, (float)b->y, (float)b->w, (float)b->h, COL_RED);
     vita2d_draw_rectangle((float)b->x + 4, (float)b->y + 4,
                           (float)b->w - 8, (float)b->h - 8, COL_BTN);
-    tw = text_width(UI_TEXT_SCALE, b->label);
+    tw = text_width(UI_TEXT_SCALE, label);
     draw_text(UI_TEXT_SCALE, b->x + (b->w - tw) / 2, b->y + (b->h - UI_TEXT_H) / 2,
-              COL_TEXT, b->label);
+              COL_TEXT, label);
+}
+
+static void draw_button(const Button *b)
+{
+    draw_button_l(b, b->label);
 }
 
 static void draw_ip_screen(void)
@@ -281,11 +417,30 @@ static void draw_ip_screen(void)
 
 static void draw_remote_screen(void)
 {
+    char l1[48];
+    char stat[80];
     int i;
-    draw_text(5.0f, 32, 48, COL_RED, "GLEEP REMOTE");
-    for (i = 0; i < REMOTE_BTN_COUNT; i++)
-        draw_button(&remote_buttons[i]);
-    draw_text(3.0f, 126, 500, COL_GREEN, "TAP A BUTTON TO SEND A COMMAND");
+
+    draw_text(5.0f, 32, 24, COL_RED, "GLEEP REMOTE");
+
+    /* LCD panel mirroring the server's status reply. */
+    vita2d_draw_rectangle(126, 88, 708, 96, COL_RED);
+    vita2d_draw_rectangle(130, 92, 700, 88, COL_PANEL);
+    snprintf(l1, sizeof(l1), "CH %02d/%02d  %s",
+             g_ch, g_total, g_paused ? "PAUSED" : "PLAYING");
+    draw_text(3.0f, 146, 104, COL_GREEN, l1);
+    draw_text(2.0f, 146, 144, COL_GREEN, g_name);
+
+    for (i = 0; i < REMOTE_BTN_COUNT; i++) {
+        const Button *b = &remote_buttons[i];
+        /* The pause button mirrors the server's state, like the PC remote. */
+        const char *lab = (b->action == ACT_PAUSE)
+                          ? (g_paused ? "PLAY" : "PAUSE") : b->label;
+        draw_button_l(b, lab);
+    }
+
+    snprintf(stat, sizeof(stat), "%s", g_status);
+    draw_text(2.0f, 126, 516, COL_GREEN, stat);
 }
 
 static void init_net(void)
@@ -347,8 +502,6 @@ int main(void)
             draw_ip_screen();
         else
             draw_remote_screen();
-
-        draw_text(3.0f, 16, 12, COL_GREEN, g_status);
 
         vita2d_end_drawing();
         vita2d_swap_buffers();
