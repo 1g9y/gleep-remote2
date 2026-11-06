@@ -247,7 +247,7 @@ static void parse_sld(const char *r)
         const char *semi = strchr(p, ';');
         size_t seg = semi ? (size_t)(semi - p) : strlen(p);
         char segbuf[64];
-        const char *eq;
+        const *eq;
         int i;
         float v;
 
@@ -654,7 +654,7 @@ static void touch_calibrate(void)
      * sceTouchPeek never returns any reports. */
     sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT,
                              SCE_TOUCH_SAMPLING_STATE_START);
-    sceTouchEnableTouchforce(SCE_TOUCH_PORT_FRONT);
+    sceTouchEnableTouchForce(SCE_TOUCH_PORT_FRONT);
 
     memset(&pinfo, 0, sizeof(pinfo));
     sceTouchGetPanelInfo(SCE_TOUCH_PORT_FRONT, &pinfo);
