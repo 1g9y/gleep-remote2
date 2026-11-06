@@ -19,9 +19,9 @@ target_link_libraries(${PROJECT_NAME}
     m
 )
 
-set(VITA_APPID  "GLEE00001")
-set(VITA_TITLE  "Gleep Remote")
-set(VITA_VERSION "01.00")
+set(VITA_APPID    "GLEE00001")
+set(VITA_TITLE    "Gleep Remote")
+set(VITA_VERSION  "01.00")
 
 # Resolve VITASDK: CMake variable first, then environment, then a sane default.
 if(NOT DEFINED VITASDK OR VITASDK STREQUAL "")
@@ -39,7 +39,12 @@ message(STATUS "Using VITASDK: ${VITASDK}")
 include(${VITASDK}/share/vita.cmake)
 
 vita_create_self(${PROJECT_NAME}.self ${PROJECT_NAME})
-vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_APPID} ${PROJECT_NAME} sce_sys)
-add_vpk_property(${PROJECT_NAME}.vpk "TITLE" "${VITA_TITLE}")
-add_vpk_property(${PROJECT_NAME}.vpk "APP_VER" "${VITA_VERSION}")
-add_vpk_property(${PROJECT_NAME}.vpk "PARENTAL_LEVEL" "1")
+
+vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_APPID} ${PROJECT_NAME}.self
+    VERSION ${VITA_VERSION}
+    NAME ${VITA_TITLE}
+    FILE ${CMAKE_SOURCE_DIR}/sce_sys/icon0.png sce_sys/icon0.png
+    FILE ${CMAKE_SOURCE_DIR}/sce_sys/livearea/contents/bg0.png sce_sys/livearea/contents/bg0.png
+    FILE ${CMAKE_SOURCE_DIR}/sce_sys/livearea/contents/startup.png sce_sys/livearea/contents/startup.png
+    FILE ${CMAKE_SOURCE_DIR}/sce_sys/livearea/contents/template.xml sce_sys/livearea/contents/template.xml
+)
