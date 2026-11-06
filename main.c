@@ -247,7 +247,7 @@ static void parse_sld(const char *r)
         const char *semi = strchr(p, ';');
         size_t seg = semi ? (size_t)(semi - p) : strlen(p);
         char segbuf[64];
-        const *eq;
+        char *eq;
         int i;
         float v;
 
