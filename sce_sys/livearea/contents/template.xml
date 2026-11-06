@@ -1,0 +1,8 @@
+<livearea style="a1" format-ver="01.00" content-revision="00">
+  <livearea-background>
+    <image>bg0.png</image>
+  </livearea-background>
+  <gate>
+    <startup-image>startup.png</startup-image>
+  </gate>
+</livearea>
