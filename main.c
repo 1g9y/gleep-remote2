@@ -4,9 +4,20 @@
  *   - Commands: PAUSE CH+ CH- VHS TINNY MINI GUIDE SETTINGS REFRESH PING
  *   - Reply:    CH=1;TOTAL=5;NAME=...;PAUSED=0;VHS=1;TINNY=0;MINI=0
  *               or ERR=... on failure.
- * The reply is parsed and shown on the LCD panel; PAUSE flips its label
- * between PAUSE/PLAY based on the server's reported state.
- * Press START to quit.
+ *
+ * Controls:
+ *   - Touch: tap buttons directly.
+ *   - L / R shoulder: channel down / up (hold to repeat).
+ *   - D-pad or left stick: move the green selection highlight.
+ *   - X: activate the highlighted button.
+ *   - START: quit.
+ *
+ * Networking note: the socket stays NON-BLOCKING for its whole life.
+ * We never rely on SO_NBIO=0 restoring blocking mode (that did not work
+ * reliably and made the reply read return instantly with "would block",
+ * so the status reply was lost and the LCD stayed at CH 00). Instead we
+ * wait for readability with sceNetEpollWait, then recv -- data is
+ * guaranteed ready when we read.
  *
  * Layout note: vita2d_init() creates a 960x544 framebuffer (the Vita's
  * native screen), so the UI is laid out at 960x544.
@@ -22,7 +33,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <sys/time.h>
 #include "font.h"
 
 #define SCREEN_W  960
@@ -30,11 +40,18 @@
 #define PC_PORT   8410          /* VITA_REMOTE_PORT in GleepTV */
 
 #define CONNECT_TIMEOUT_US (3 * 1000 * 1000)   /* 3s connect cap */
-#define IO_TIMEOUT_SEC     2                    /* 2s send/recv cap */
+#define REPLY_TIMEOUT_US   (4 * 1000 * 1000)   /* 4s reply wait cap */
 
 /* UI text: 4x-scaled 5x7 font = 20x28 px glyphs. */
 #define UI_TEXT_SCALE 4.0f
 #define UI_TEXT_H     28
+
+/* Gamepad navigation timing (the main loop is vblank-synced, ~60fps). */
+#define NAV_DEADZONE       40   /* stick deadzone, out of 128 */
+#define NAV_DELAY_FRAMES   30   /* 0.5s before nav repeat kicks in */
+#define NAV_REPEAT_FRAMES  12   /* nav repeat every 0.2s */
+#define LR_DELAY_FRAMES    30   /* 0.5s before L/R repeat kicks in */
+#define LR_REPEAT_FRAMES   18   /* L/R repeat every 0.3s */
 
 #define COL_BG     RGBA8(8, 8, 8, 255)
 #define COL_PANEL  RGBA8(16, 16, 16, 255)
@@ -69,6 +86,14 @@ static char g_reply[128] = "";
 static int  g_ch = 0, g_total = 0, g_paused = 0;
 static char g_name[40] = "NO SIGNAL";
 
+/* Gamepad navigation state. */
+static int g_sel[2] = {12, 0};  /* selected button index per screen;
+                                 * IP screen starts on CONNECT (12),
+                                 * remote screen on PAUSE (0). */
+static unsigned int g_prev_pad = 0;
+static int g_nav_hold = 0;
+static int g_lr_hold = 0;
+
 static int t_min_x = 0, t_min_y = 0, t_span_x = 1, t_span_y = 1;
 
 /* ---- IP screen: 4x3 keypad + connect/remote ---- */
@@ -89,6 +114,7 @@ static Button ip_buttons[] = {
     {488, 424, 240, 64, "REMOTE", ACT_REMOTE, 0},
 };
 #define IP_BTN_COUNT ((int)(sizeof(ip_buttons) / sizeof(ip_buttons[0])))
+#define IP_SEL_DEFAULT 12   /* CONNECT */
 
 /* ---- Remote screen: commands the GleepTV server actually handles ---- */
 static Button remote_buttons[] = {
@@ -105,6 +131,7 @@ static Button remote_buttons[] = {
     {500, 434, 340, 72, "IP/SET",   ACT_IPSCREEN, 0},
 };
 #define REMOTE_BTN_COUNT ((int)(sizeof(remote_buttons) / sizeof(remote_buttons[0])))
+#define REMOTE_SEL_DEFAULT 0   /* PAUSE */
 
 static void set_status(const char *msg)
 {
@@ -163,8 +190,11 @@ static void parse_reply(const char *r)
 }
 
 /* Connect to the PC, send one command, read the one-line reply.
+ * The socket is non-blocking throughout; epoll governs all waiting so
+ * nothing here can hang longer than the timeouts below, and the reply
+ * is only read once epoll says it has arrived.
  * Returns 0 and fills g_reply on any reply; -1 with an ERR=... in
- * g_reply on failure. Never blocks longer than ~5s total. */
+ * g_reply on failure. */
 static int send_command(const char *cmd)
 {
     int sock = -1, eid = -1;
@@ -172,9 +202,8 @@ static int send_command(const char *cmd)
     SceNetEpollEvent ev;
     SceNetEpollEvent out[1];
     char line[48];
-    char buf[160];
-    struct timeval tv;
-    int on = 1, off = 0;
+    char buf[192];
+    int on = 1;
     int err = 0;
     unsigned int errlen = sizeof(err);
     int total = 0, len, ret;
@@ -192,7 +221,7 @@ static int send_command(const char *cmd)
         return -1;
     }
 
-    /* Non-blocking connect so a wrong IP can't freeze the UI. */
+    /* Non-blocking for the whole session; we wait with epoll. */
     sceNetSetsockopt(sock, SCE_NET_SOL_SOCKET, SCE_NET_SO_NBIO, &on, sizeof(on));
 
     memset(&addr, 0, sizeof(addr));
@@ -204,66 +233,83 @@ static int send_command(const char *cmd)
         return -1;
     }
 
-    ret = sceNetConnect(sock, (SceNetSockaddr *)&addr, sizeof(addr));
-    if (ret < 0 && ret != SCE_NET_ERROR_EINPROGRESS) {
-        snprintf(g_reply, sizeof(g_reply), "ERR=REFUSED");
+    eid = sceNetEpollCreate("gleep", 0);
+    if (eid < 0) {
+        snprintf(g_reply, sizeof(g_reply), "ERR=EPOLL");
         sceNetSocketClose(sock);
         return -1;
     }
+
+    ret = sceNetConnect(sock, (SceNetSockaddr *)&addr, sizeof(addr));
+    if (ret < 0 && ret != SCE_NET_ERROR_EINPROGRESS) {
+        snprintf(g_reply, sizeof(g_reply), "ERR=REFUSED");
+        sceNetEpollDestroy(eid);
+        sceNetSocketClose(sock);
+        return -1;
+    }
+
     if (ret == SCE_NET_ERROR_EINPROGRESS) {
+        /* Wait for the connect to finish (socket becomes writable). */
         memset(&ev, 0, sizeof(ev));
         ev.events = SCE_NET_EPOLLOUT;
         ev.data.fd = sock;
-        eid = sceNetEpollCreate("gleep", 0);
-        if (eid < 0 ||
-            sceNetEpollControl(eid, SCE_NET_EPOLL_CTL_ADD, sock, &ev) < 0) {
-            snprintf(g_reply, sizeof(g_reply), "ERR=EPOLL");
-            if (eid >= 0) sceNetEpollDestroy(eid);
-            sceNetSocketClose(sock);
-            return -1;
-        }
-        if (sceNetEpollWait(eid, out, 1, CONNECT_TIMEOUT_US) <= 0) {
+        if (sceNetEpollControl(eid, SCE_NET_EPOLL_CTL_ADD, sock, &ev) < 0 ||
+            sceNetEpollWait(eid, out, 1, CONNECT_TIMEOUT_US) <= 0) {
             snprintf(g_reply, sizeof(g_reply), "ERR=TIMEOUT");
             sceNetEpollDestroy(eid);
             sceNetSocketClose(sock);
             return -1;
         }
-        sceNetEpollDestroy(eid);
-        eid = -1;
         sceNetGetsockopt(sock, SCE_NET_SOL_SOCKET, SCE_NET_SO_ERROR,
                          &err, &errlen);
         if (err != 0) {
             snprintf(g_reply, sizeof(g_reply), "ERR=REFUSED");
+            sceNetEpollDestroy(eid);
             sceNetSocketClose(sock);
             return -1;
         }
     }
 
-    /* Back to blocking for the data phase, with hard timeouts. */
-    sceNetSetsockopt(sock, SCE_NET_SOL_SOCKET, SCE_NET_SO_NBIO, &off, sizeof(off));
-    tv.tv_sec = IO_TIMEOUT_SEC;
-    tv.tv_usec = 0;
-    sceNetSetsockopt(sock, SCE_NET_SOL_SOCKET, SCE_NET_SO_RCVTIMEO, &tv, sizeof(tv));
-    sceNetSetsockopt(sock, SCE_NET_SOL_SOCKET, SCE_NET_SO_SNDTIMEO, &tv, sizeof(tv));
-
-    snprintf(line, sizeof(line), "%s\n", cmd);
-    if (sceNetSend(sock, line, (unsigned int)strlen(line), 0) < 0) {
-        snprintf(g_reply, sizeof(g_reply), "ERR=SEND");
+    /* From here on we only ever wait for readability. */
+    memset(&ev, 0, sizeof(ev));
+    ev.events = SCE_NET_EPOLLIN;
+    ev.data.fd = sock;
+    if (sceNetEpollControl(eid, SCE_NET_EPOLL_CTL_MOD, sock, &ev) < 0) {
+        snprintf(g_reply, sizeof(g_reply), "ERR=EPOLL");
+        sceNetEpollDestroy(eid);
         sceNetSocketClose(sock);
         return -1;
     }
 
-    /* Read one reply line (the server sends status + '\n'). */
+    snprintf(line, sizeof(line), "%s\n", cmd);
+    if (sceNetSend(sock, line, (unsigned int)strlen(line), 0) < 0) {
+        snprintf(g_reply, sizeof(g_reply), "ERR=SEND");
+        sceNetEpollDestroy(eid);
+        sceNetSocketClose(sock);
+        return -1;
+    }
+
+    /* Wait for the reply, then read until '\n' (or the peer closes). */
     memset(buf, 0, sizeof(buf));
     while (total < (int)sizeof(buf) - 1) {
+        if (sceNetEpollWait(eid, out, 1, REPLY_TIMEOUT_US) <= 0)
+            break;   /* no reply within the timeout */
         len = sceNetRecv(sock, buf + total,
                          (unsigned int)(sizeof(buf) - 1 - total), 0);
-        if (len <= 0)
-            break;
+        if (len < 0) {
+            if (len == SCE_NET_ERROR_EWOULDBLOCK ||
+                len == SCE_NET_ERROR_EAGAIN)
+                continue;   /* spurious; wait again */
+            break;          /* real error */
+        }
+        if (len == 0)
+            break;          /* peer closed */
         total += len;
         if (memchr(buf, '\n', (size_t)total))
             break;
     }
+
+    sceNetEpollDestroy(eid);
     sceNetSocketClose(sock);
 
     if (total <= 0) {
@@ -281,6 +327,13 @@ static int send_command(const char *cmd)
 
     parse_reply(buf);
     return 0;
+}
+
+/* Channel step from L/R (and anything else that wants it). */
+static void do_channel(int delta)
+{
+    send_command(delta > 0 ? "CH+" : "CH-");
+    set_status(g_reply);
 }
 
 static void do_action(const Button *b)
@@ -313,28 +366,27 @@ static void do_action(const Button *b)
             break;
         }
         g_screen = SCR_REMOTE;
+        g_sel[SCR_REMOTE] = REMOTE_SEL_DEFAULT;
         /* PING verifies the link and fills the LCD; it has no side
-         * effects on the server. */
-        if (send_command("PING") == 0)
-            set_status("CONNECTED");
-        else
-            set_status(g_reply);
+         * effects on the server. The raw reply is shown as status. */
+        send_command("PING");
+        set_status(g_reply);
         break;
     case ACT_REMOTE:
         g_screen = SCR_REMOTE;
+        g_sel[SCR_REMOTE] = REMOTE_SEL_DEFAULT;
         break;
     case ACT_IPSCREEN:
         g_screen = SCR_IP;
+        g_sel[SCR_IP] = IP_SEL_DEFAULT;
         set_status("ENTER PC IP THEN TAP CONNECT");
         break;
     default: {
         const char *cmd = cmd_for_action(b->action);
         if (!cmd)
             break;
-        if (send_command(cmd) == 0)
-            set_status("OK");
-        else
-            set_status(g_reply);
+        send_command(cmd);
+        set_status(g_reply);
         break;
     }
     }
@@ -349,10 +401,74 @@ static void handle_tap(int x, int y)
     for (i = 0; i < count; i++) {
         const Button *b = &btns[i];
         if (x >= b->x && x < b->x + b->w && y >= b->y && y < b->y + b->h) {
+            g_sel[g_screen] = i;   /* keep highlight in sync with touch */
             do_action(b);
             return;
         }
     }
+}
+
+/* Move the selection one "step" in direction (dx, dy), each -1..1.
+ * Picks the nearest button center in that direction, penalizing
+ * sideways offset so grids behave sensibly. */
+static void nav_move(int screen, int dx, int dy)
+{
+    const Button *btns = (screen == SCR_IP) ? ip_buttons : remote_buttons;
+    int count = (screen == SCR_IP) ? IP_BTN_COUNT : REMOTE_BTN_COUNT;
+    int cur = g_sel[screen];
+    int cx = btns[cur].x + btns[cur].w / 2;
+    int cy = btns[cur].y + btns[cur].h / 2;
+    int best = -1, best_score = 0;
+    int i;
+
+    for (i = 0; i < count; i++) {
+        int nx = btns[i].x + btns[i].w / 2;
+        int ny = btns[i].y + btns[i].h / 2;
+        int ox = nx - cx, oy = ny - cy;
+        int primary, perp, score;
+
+        if (i == cur)
+            continue;
+        if (dx != 0) {
+            if (ox * dx <= 8)       /* must be genuinely to the side */
+                continue;
+            primary = ox * dx;
+            perp = oy > 0 ? oy : -oy;
+        } else {
+            if (oy * dy <= 8)       /* must be genuinely above/below */
+                continue;
+            primary = oy * dy;
+            perp = ox > 0 ? ox : -ox;
+        }
+        score = primary + 3 * perp;
+        if (best < 0 || score < best_score) {
+            best = i;
+            best_score = score;
+        }
+    }
+    if (best >= 0)
+        g_sel[screen] = best;
+}
+
+/* Current nav direction from d-pad or left stick: 0 left, 1 right,
+ * 2 up, 3 down, -1 none. Stick uses a deadzone + dominant axis. */
+static int nav_direction(const SceCtrlData *pad)
+{
+    int dx = (int)pad->lx - 128;
+    int dy = (int)pad->ly - 128;
+    int ax = dx > 0 ? dx : -dx;
+    int ay = dy > 0 ? dy : -dy;
+
+    if (pad->buttons & SCE_CTRL_LEFT)  return 0;
+    if (pad->buttons & SCE_CTRL_RIGHT) return 1;
+    if (pad->buttons & SCE_CTRL_UP)    return 2;
+    if (pad->buttons & SCE_CTRL_DOWN)  return 3;
+
+    if (ax < NAV_DEADZONE && ay < NAV_DEADZONE)
+        return -1;
+    if (ax >= ay)
+        return dx > 0 ? 1 : 0;
+    return dy > 0 ? 3 : 2;
 }
 
 static void touch_calibrate(void)
@@ -381,20 +497,16 @@ static void touch_to_screen(int rx, int ry, int *sx, int *sy)
     *sy = (ry - t_min_y) * SCREEN_H / t_span_y;
 }
 
-static void draw_button_l(const Button *b, const char *label)
+static void draw_button_sel(const Button *b, const char *label, int selected)
 {
     int tw;
-    vita2d_draw_rectangle((float)b->x, (float)b->y, (float)b->w, (float)b->h, COL_RED);
+    vita2d_draw_rectangle((float)b->x, (float)b->y, (float)b->w, (float)b->h,
+                          selected ? COL_GREEN : COL_RED);
     vita2d_draw_rectangle((float)b->x + 4, (float)b->y + 4,
                           (float)b->w - 8, (float)b->h - 8, COL_BTN);
     tw = text_width(UI_TEXT_SCALE, label);
     draw_text(UI_TEXT_SCALE, b->x + (b->w - tw) / 2, b->y + (b->h - UI_TEXT_H) / 2,
-              COL_TEXT, label);
-}
-
-static void draw_button(const Button *b)
-{
-    draw_button_l(b, b->label);
+              selected ? COL_GREEN : COL_TEXT, label);
 }
 
 static void draw_ip_screen(void)
@@ -412,13 +524,13 @@ static void draw_ip_screen(void)
     draw_text(UI_TEXT_SCALE, 216 + (528 - tw) / 2, 120, COL_GREEN, buf);
 
     for (i = 0; i < IP_BTN_COUNT; i++)
-        draw_button(&ip_buttons[i]);
+        draw_button_sel(&ip_buttons[i], ip_buttons[i].label,
+                        i == g_sel[SCR_IP]);
 }
 
 static void draw_remote_screen(void)
 {
     char l1[48];
-    char stat[80];
     int i;
 
     draw_text(5.0f, 32, 24, COL_RED, "GLEEP REMOTE");
@@ -436,11 +548,8 @@ static void draw_remote_screen(void)
         /* The pause button mirrors the server's state, like the PC remote. */
         const char *lab = (b->action == ACT_PAUSE)
                           ? (g_paused ? "PLAY" : "PAUSE") : b->label;
-        draw_button_l(b, lab);
+        draw_button_sel(b, lab, i == g_sel[SCR_REMOTE]);
     }
-
-    snprintf(stat, sizeof(stat), "%s", g_status);
-    draw_text(2.0f, 126, 516, COL_GREEN, stat);
 }
 
 static void init_net(void)
@@ -477,10 +586,53 @@ int main(void)
         SceTouchData td;
         int touched = 0;
         int tx = 0, ty = 0;
+        int pressed;
+        int dir;
 
         sceCtrlPeekBufferPositive(0, &pad, 1);
         if (pad.buttons & SCE_CTRL_START)
             break;
+
+        pressed = (int)(pad.buttons & ~g_prev_pad);
+
+        /* L / R shoulder: channel down / up, with hold-to-repeat. */
+        if (pressed & SCE_CTRL_RTRIGGER) {
+            do_channel(+1);
+            g_lr_hold = 0;
+        } else if (pressed & SCE_CTRL_LTRIGGER) {
+            do_channel(-1);
+            g_lr_hold = 0;
+        } else if (pad.buttons & (SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER)) {
+            g_lr_hold++;
+            if (g_lr_hold > LR_DELAY_FRAMES &&
+                ((g_lr_hold - LR_DELAY_FRAMES) % LR_REPEAT_FRAMES) == 0)
+                do_channel((pad.buttons & SCE_CTRL_RTRIGGER) ? +1 : -1);
+        } else {
+            g_lr_hold = 0;
+        }
+
+        /* D-pad / left stick: move the selection, with repeat. */
+        dir = nav_direction(&pad);
+        if (dir >= 0) {
+            static const int ndx[4] = {-1, 1, 0, 0};
+            static const int ndy[4] = {0, 0, -1, 1};
+            g_nav_hold++;
+            if (g_nav_hold == 1 ||
+                (g_nav_hold > NAV_DELAY_FRAMES &&
+                 ((g_nav_hold - NAV_DELAY_FRAMES) % NAV_REPEAT_FRAMES) == 0))
+                nav_move(g_screen, ndx[dir], ndy[dir]);
+        } else {
+            g_nav_hold = 0;
+        }
+
+        /* X: activate the highlighted button. */
+        if (pressed & SCE_CTRL_CROSS) {
+            const Button *btns = (g_screen == SCR_IP) ? ip_buttons
+                                                      : remote_buttons;
+            do_action(&btns[g_sel[g_screen]]);
+        }
+
+        g_prev_pad = pad.buttons;
 
         memset(&td, 0, sizeof(td));
         if (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &td, 1) > 0 && td.reportNum > 0) {
@@ -502,6 +654,9 @@ int main(void)
             draw_ip_screen();
         else
             draw_remote_screen();
+
+        /* Raw last reply from the PC -- the ground truth for debugging. */
+        draw_text(2.0f, 16, 516, COL_GREEN, g_status);
 
         vita2d_end_drawing();
         vita2d_swap_buffers();
