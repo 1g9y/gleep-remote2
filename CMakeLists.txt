@@ -23,7 +23,21 @@ set(VITA_APPID  "GLEE00001")
 set(VITA_TITLE  "Gleep Remote")
 set(VITA_VERSION "01.00")
 
+# Resolve VITASDK: CMake variable first, then environment, then a sane default.
+if(NOT DEFINED VITASDK OR VITASDK STREQUAL "")
+    set(VITASDK "$ENV{VITASDK}")
+endif()
+if(NOT VITASDK OR VITASDK STREQUAL "")
+    if(EXISTS "/usr/local/vitasdk")
+        set(VITASDK "/usr/local/vitasdk")
+    else()
+        message(FATAL_ERROR "VITASDK not set and /usr/local/vitasdk not found")
+    endif()
+endif()
+
+message(STATUS "Using VITASDK: ${VITASDK}")
 include(${VITASDK}/share/vita.cmake)
+
 vita_create_self(${PROJECT_NAME}.self ${PROJECT_NAME})
 vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_APPID} ${PROJECT_NAME} sce_sys)
 add_vpk_property(${PROJECT_NAME}.vpk "TITLE" "${VITA_TITLE}")
