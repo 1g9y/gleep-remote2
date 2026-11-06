@@ -2,6 +2,14 @@ cmake_minimum_required(VERSION 3.10)
 project(gleep_remote C)
 set(CMAKE_C_STANDARD 99)
 
+# Sanity check: must be cross-compiling with the Vita toolchain, not host gcc.
+if(NOT CMAKE_C_COMPILER MATCHES "arm-vita-eabi")
+    message(FATAL_ERROR
+        "Not using the Vita cross-compiler (found: ${CMAKE_C_COMPILER}).\n"
+        "Configure with the VitaSDK toolchain file, e.g.:\n"
+        "  cmake -DCMAKE_TOOLCHAIN_FILE=${VITASDK}/share/vita.toolchain.cmake ..")
+endif()
+
 add_executable(${PROJECT_NAME} main.c font.c)
 
 target_link_libraries(${PROJECT_NAME}
@@ -36,6 +44,11 @@ if(NOT VITASDK OR VITASDK STREQUAL "")
 endif()
 
 message(STATUS "Using VITASDK: ${VITASDK}")
+
+# Belt and suspenders: SDK headers/libs live in these two spots.
+include_directories(${VITASDK}/include ${VITASDK}/arm-vita-eabi/include)
+link_directories(${VITASDK}/lib ${VITASDK}/arm-vita-eabi/lib)
+
 include(${VITASDK}/share/vita.cmake)
 
 vita_create_self(${PROJECT_NAME}.self ${PROJECT_NAME})
