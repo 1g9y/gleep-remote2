@@ -1,15 +1,21 @@
 /* Gleep Remote - PS Vita client for GleepTV.
  * Protocol (matches GleepTV's RemoteServer on port 8410):
  *   - Connect TCP, send one command + '\n', read one reply line.
- *   - Commands: PAUSE CH+ CH- VHS TINNY MINI GUIDE SETTINGS REFRESH PING
+ *   - Commands: PAUSE MUTE CH+ CH- VHS TINNY MINI GUIDE REFRESH PING
+ *               GETSET SETALL:k=v;k=v;...
  *   - Reply:    CH=1;TOTAL=5;NAME=...;PAUSED=0;VHS=1;TINNY=0;MINI=0
+ *               SLD=k=v;k=v;...        (reply to GETSET)
+ *               OK=SAVED N             (reply to SETALL)
  *               or ERR=... on failure.
  *
  * Controls:
- *   - Touch: tap buttons directly.
+ *   - Touch: tap buttons directly. On the settings screen, tap a slider
+ *     bar to set that value directly, or tap the row to select it.
  *   - L / R shoulder: channel down / up (hold to repeat).
- *   - D-pad or left stick: move the green selection highlight.
+ *   - D-pad or left stick: move the green selection highlight. On the
+ *     settings screen, up/down picks a slider, left/right adjusts it.
  *   - X: activate the highlighted button.
+ *   - O (circle): back out of the settings screen without saving.
  *   - START: quit.
  *
  * Networking note: the socket stays NON-BLOCKING for its whole life.
@@ -60,14 +66,15 @@
 #define COL_BTN    RGBA8(38, 38, 38, 255)
 #define COL_TEXT   RGBA8(235, 235, 235, 255)
 
-enum { SCR_IP = 0, SCR_REMOTE };
+enum { SCR_IP = 0, SCR_REMOTE, SCR_SETTINGS };   /* [NEW] settings screen */
 
 enum {
-    ACT_PAUSE = 1, ACT_CHUP, ACT_CHDN,
+    ACT_PAUSE = 1, ACT_CHUP, ACT_CHDN, ACT_MUTE,   /* [NEW] ACT_MUTE */
     ACT_VHS, ACT_TINNY, ACT_MINI,
     ACT_GUIDE, ACT_SETTINGS, ACT_REFRESH, ACT_PING,
     ACT_DIGIT, ACT_DOT, ACT_DEL,
-    ACT_CONNECT, ACT_REMOTE, ACT_IPSCREEN
+    ACT_CONNECT, ACT_REMOTE, ACT_IPSCREEN,
+    ACT_SAVE, ACT_BACK                             /* [NEW] settings buttons */
 };
 
 typedef struct {
@@ -76,6 +83,36 @@ typedef struct {
     int action;
     int digit;
 } Button;
+
+/* [NEW] ---- Settings sliders: must match REMOTE_SLIDER_KEYS order in
+ * gleepTV.py exactly, or GETSET/SETALL values land on the wrong keys. */
+#define SLIDER_COUNT 12
+#define SLIDER_STEP  0.05f
+
+static const char *slider_keys[SLIDER_COUNT] = {
+    "vhs_intensity", "vhs_drift", "vhs_scanline_depth", "vhs_bloom",
+    "vhs_tracking_bar", "vhs_aberration", "vhs_bleed", "vhs_grain",
+    "vhs_scanlines", "vhs_white_lines_opacity",
+    "vhs_white_lines_density", "vhs_static_opacity"
+};
+
+static const char *slider_labels[SLIDER_COUNT] = {
+    "MASTER INTENSITY", "DRIFT / WOBBLE", "SCANLINE DEPTH", "BLOOM",
+    "TRACKING BAR", "RGB ABERRATION", "COLOR BLEED", "FILM GRAIN",
+    "OVERLAY SCANLINES", "WHITE LINES OPAC",
+    "WHITE LINES DENS", "STATIC OPACITY"
+};
+
+static float g_vals[SLIDER_COUNT];      /* current slider values, 0.0-1.0 */
+static int   g_vals_valid = 0;          /* set once GETSET has populated them */
+
+/* [NEW] Settings screen geometry: 12 rows + SAVE/BACK buttons. */
+#define SET_ROW_H   32
+#define SET_TOP     64
+#define SET_BAR_X   470
+#define SET_BAR_W   340
+#define SET_VAL_X   824
+#define SET_ITEMS   (SLIDER_COUNT + 2)   /* sliders + SAVE + BACK */
 
 static char g_ip[16] = "192.168.1.";
 static int  g_screen = SCR_IP;
@@ -87,9 +124,10 @@ static int  g_ch = 0, g_total = 0, g_paused = 0;
 static char g_name[40] = "NO SIGNAL";
 
 /* Gamepad navigation state. */
-static int g_sel[2] = {12, 0};  /* selected button index per screen;
-                                 * IP screen starts on CONNECT (12),
-                                 * remote screen on PAUSE (0). */
+static int g_sel[3] = {12, 0, 0};  /* [NEW] third slot: settings screen;
+                                    * IP screen starts on CONNECT (12),
+                                    * remote screen on PAUSE (0),
+                                    * settings screen on first slider (0). */
 static unsigned int g_prev_pad = 0;
 static int g_nav_hold = 0;
 static int g_lr_hold = 0;
@@ -116,22 +154,32 @@ static Button ip_buttons[] = {
 #define IP_BTN_COUNT ((int)(sizeof(ip_buttons) / sizeof(ip_buttons[0])))
 #define IP_SEL_DEFAULT 12   /* CONNECT */
 
-/* ---- Remote screen: commands the GleepTV server actually handles ---- */
+/* ---- Remote screen: commands the GleepTV server actually handles.
+ * [NEW] 4x3 grid with MUTE added next to PAUSE. ---- */
 static Button remote_buttons[] = {
     {126, 200, 220, 72, "PAUSE",    ACT_PAUSE,    0},
-    {370, 200, 220, 72, "CH +",     ACT_CHUP,     0},
-    {614, 200, 220, 72, "CH -",     ACT_CHDN,     0},
-    {126, 278, 220, 72, "VHS FX",   ACT_VHS,      0},
-    {370, 278, 220, 72, "TINNY",    ACT_TINNY,    0},
-    {614, 278, 220, 72, "MINI TV",  ACT_MINI,     0},
-    {126, 356, 220, 72, "GUIDE",    ACT_GUIDE,    0},
-    {370, 356, 220, 72, "SETTINGS", ACT_SETTINGS, 0},
-    {614, 356, 220, 72, "REFRESH",  ACT_REFRESH,  0},
-    {126, 434, 340, 72, "PING TEST",ACT_PING,     0},
-    {500, 434, 340, 72, "IP/SET",   ACT_IPSCREEN, 0},
+    {370, 200, 220, 72, "MUTE",     ACT_MUTE,     0},   /* [NEW] */
+    {614, 200, 220, 72, "CH +",     ACT_CHUP,     0},
+    {126, 278, 220, 72, "CH -",     ACT_CHDN,     0},
+    {370, 278, 220, 72, "VHS FX",   ACT_VHS,      0},
+    {614, 278, 220, 72, "TINNY",    ACT_TINNY,    0},
+    {126, 356, 220, 72, "MINI TV",  ACT_MINI,     0},
+    {370, 356, 220, 72, "GUIDE",    ACT_GUIDE,    0},
+    {614, 356, 220, 72, "SETTINGS", ACT_SETTINGS, 0},
+    {126, 434, 220, 72, "REFRESH",  ACT_REFRESH,  0},
+    {370, 434, 220, 72, "PING TEST",ACT_PING,     0},
+    {614, 434, 220, 72, "IP/SET",   ACT_IPSCREEN, 0},
 };
 #define REMOTE_BTN_COUNT ((int)(sizeof(remote_buttons) / sizeof(remote_buttons[0])))
 #define REMOTE_SEL_DEFAULT 0   /* PAUSE */
+
+/* [NEW] ---- Settings screen: SAVE and BACK live at selection indices
+ * SLIDER_COUNT and SLIDER_COUNT+1. ---- */
+static Button settings_buttons[] = {
+    {126, 456, 300, 60, "SAVE", ACT_SAVE, 0},
+    {500, 456, 300, 60, "BACK", ACT_BACK, 0},
+};
+#define SET_BTN_COUNT ((int)(sizeof(settings_buttons) / sizeof(settings_buttons[0])))
 
 static void set_status(const char *msg)
 {
@@ -151,13 +199,13 @@ static const char *cmd_for_action(int action)
 {
     switch (action) {
     case ACT_PAUSE:    return "PAUSE";
+    case ACT_MUTE:     return "MUTE";     /* [NEW] */
     case ACT_CHUP:     return "CH+";
     case ACT_CHDN:     return "CH-";
     case ACT_VHS:      return "VHS";
     case ACT_TINNY:    return "TINNY";
     case ACT_MINI:     return "MINI";
     case ACT_GUIDE:    return "GUIDE";
-    case ACT_SETTINGS: return "SETTINGS";
     case ACT_REFRESH:  return "REFRESH";
     case ACT_PING:     return "PING";
     default:           return NULL;
@@ -189,20 +237,63 @@ static void parse_reply(const char *r)
     }
 }
 
+/* [NEW] Parse "SLD=key=value;key=value;..." into g_vals.
+ * Unknown keys are ignored; values are clamped to 0.0-1.0. */
+static void parse_sld(const char *r)
+{
+    const char *p = r + 4;   /* skip "SLD=" */
+
+    while (*p) {
+        const char *semi = strchr(p, ';');
+        size_t seg = semi ? (size_t)(semi - p) : strlen(p);
+        char segbuf[64];
+        const char *eq;
+        int i;
+        float v;
+
+        if (seg >= sizeof(segbuf))
+            seg = sizeof(segbuf) - 1;
+        memcpy(segbuf, p, seg);
+        segbuf[seg] = '\0';
+
+        eq = strchr(segbuf, '=');
+        if (eq != NULL) {
+            *eq = '\0';
+            if (sscanf(eq + 1, "%f", &v) == 1) {
+                if (v < 0.0f) v = 0.0f;
+                if (v > 1.0f) v = 1.0f;
+                for (i = 0; i < SLIDER_COUNT; i++) {
+                    if (strcmp(segbuf, slider_keys[i]) == 0) {
+                        g_vals[i] = v;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!semi)
+            break;
+        p = semi + 1;
+    }
+    g_vals_valid = 1;
+}
+
 /* Connect to the PC, send one command, read the one-line reply.
  * The socket is non-blocking throughout; epoll governs all waiting so
  * nothing here can hang longer than the timeouts below, and the reply
  * is only read once epoll says it has arrived.
  * Returns 0 and fills g_reply on any reply; -1 with an ERR=... in
- * g_reply on failure. */
+ * g_reply on failure.
+ * [NEW] buffers enlarged: SLD replies carry all 12 slider values
+ * (~380 bytes) and SETALL commands are ~370 bytes. */
 static int send_command(const char *cmd)
 {
     int sock = -1, eid = -1;
     SceNetSockaddrIn addr;
     SceNetEpollEvent ev;
     SceNetEpollEvent out[1];
-    char line[48];
-    char buf[192];
+    char line[512];
+    char buf[512];
     int on = 1;
     int err = 0;
     unsigned int errlen = sizeof(err);
@@ -320,6 +411,13 @@ static int send_command(const char *cmd)
     while (total > 0 && (buf[total - 1] == '\n' || buf[total - 1] == '\r'))
         buf[--total] = '\0';
 
+    /* [NEW] SLD replies go to the slider values, not the LCD. */
+    if (strncmp(buf, "SLD=", 4) == 0) {
+        parse_sld(buf);
+        snprintf(g_reply, sizeof(g_reply), "SLD LOADED");
+        return 0;
+    }
+
     snprintf(g_reply, sizeof(g_reply), "%s", buf);
 
     if (strncmp(buf, "ERR", 3) == 0)
@@ -334,6 +432,14 @@ static void do_channel(int delta)
 {
     send_command(delta > 0 ? "CH+" : "CH-");
     set_status(g_reply);
+}
+
+/* [NEW] Clamp a slider value into 0.0-1.0. */
+static float clamp_val(float v)
+{
+    if (v < 0.0f) return 0.0f;
+    if (v > 1.0f) return 1.0f;
+    return v;
 }
 
 static void do_action(const Button *b)
@@ -381,6 +487,39 @@ static void do_action(const Button *b)
         g_sel[SCR_IP] = IP_SEL_DEFAULT;
         set_status("ENTER PC IP THEN TAP CONNECT");
         break;
+    case ACT_SETTINGS:
+        /* [NEW] SETTINGS now opens the Vita-side slider editor instead of
+         * poking the PC's own settings dialog. GETSET fills the sliders
+         * with the server's current values. */
+        g_screen = SCR_SETTINGS;
+        g_sel[SCR_SETTINGS] = 0;
+        send_command("GETSET");
+        set_status(g_vals_valid ? "SLIDERS LOADED - ADJUST THEN SAVE"
+                                : g_reply);
+        break;
+    case ACT_SAVE: {
+        /* [NEW] Push all 12 sliders back with SETALL. The server saves,
+         * regenerates the shader, and restarts the stream. */
+        char setbuf[512];
+        int i, n;
+        n = snprintf(setbuf, sizeof(setbuf), "SETALL:");
+        for (i = 0; i < SLIDER_COUNT && n > 0 && n < (int)sizeof(setbuf); i++)
+            n += snprintf(setbuf + n, sizeof(setbuf) - n,
+                          "%s=%.3f;", slider_keys[i], g_vals[i]);
+        send_command(setbuf);
+        set_status(g_reply);
+        if (strncmp(g_reply, "OK", 2) == 0) {
+            g_screen = SCR_REMOTE;
+            g_sel[SCR_REMOTE] = REMOTE_SEL_DEFAULT;
+        }
+        break;
+    }
+    case ACT_BACK:
+        /* [NEW] Leave the settings screen without saving. */
+        g_screen = SCR_REMOTE;
+        g_sel[SCR_REMOTE] = REMOTE_SEL_DEFAULT;
+        set_status("SETTINGS NOT SAVED");
+        break;
     default: {
         const char *cmd = cmd_for_action(b->action);
         if (!cmd)
@@ -392,11 +531,47 @@ static void do_action(const Button *b)
     }
 }
 
+/* [NEW] Hit-testing for the settings screen: slider rows first (tap on
+ * the bar sets the value directly, tap elsewhere in the row selects),
+ * then SAVE/BACK. */
+static void handle_settings_tap(int x, int y)
+{
+    int i;
+
+    for (i = 0; i < SLIDER_COUNT; i++) {
+        int ry = SET_TOP + i * SET_ROW_H;
+        if (y >= ry && y < ry + SET_ROW_H) {
+            g_sel[SCR_SETTINGS] = i;
+            if (x >= SET_BAR_X && x <= SET_BAR_X + SET_BAR_W) {
+                g_vals[i] = clamp_val(
+                    (float)(x - SET_BAR_X) / (float)SET_BAR_W);
+            }
+            return;
+        }
+    }
+
+    for (i = 0; i < SET_BTN_COUNT; i++) {
+        const Button *b = &settings_buttons[i];
+        if (x >= b->x && x < b->x + b->w && y >= b->y && y < b->y + b->h) {
+            do_action(b);
+            return;
+        }
+    }
+}
+
 static void handle_tap(int x, int y)
 {
-    const Button *btns = (g_screen == SCR_IP) ? ip_buttons : remote_buttons;
-    int count = (g_screen == SCR_IP) ? IP_BTN_COUNT : REMOTE_BTN_COUNT;
+    const Button *btns;
+    int count;
     int i;
+
+    if (g_screen == SCR_SETTINGS) {
+        handle_settings_tap(x, y);
+        return;
+    }
+
+    btns = (g_screen == SCR_IP) ? ip_buttons : remote_buttons;
+    count = (g_screen == SCR_IP) ? IP_BTN_COUNT : REMOTE_BTN_COUNT;
 
     for (i = 0; i < count; i++) {
         const Button *b = &btns[i];
@@ -479,7 +654,7 @@ static void touch_calibrate(void)
      * sceTouchPeek never returns any reports. */
     sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT,
                              SCE_TOUCH_SAMPLING_STATE_START);
-    sceTouchEnableTouchForce(SCE_TOUCH_PORT_FRONT);
+    sceTouchEnableTouchforce(SCE_TOUCH_PORT_FRONT);
 
     memset(&pinfo, 0, sizeof(pinfo));
     sceTouchGetPanelInfo(SCE_TOUCH_PORT_FRONT, &pinfo);
@@ -552,6 +727,44 @@ static void draw_remote_screen(void)
     }
 }
 
+/* [NEW] Settings screen: 12 slider rows + SAVE/BACK. The selected row
+ * gets a green border; the filled part of each bar is the value. */
+static void draw_settings_screen(void)
+{
+    int i;
+
+    draw_text(5.0f, 32, 16, COL_RED, "VHS SETTINGS");
+    draw_text(2.0f, 480, 36, COL_GREEN,
+              "UP/DOWN SELECT  LEFT/RIGHT ADJUST");
+
+    for (i = 0; i < SLIDER_COUNT; i++) {
+        int ry = SET_TOP + i * SET_ROW_H;
+        int sel = (i == g_sel[SCR_SETTINGS]);
+        char val[8];
+
+        draw_text(2.0f, 16, ry + 9, sel ? COL_GREEN : COL_TEXT,
+                  slider_labels[i]);
+
+        if (sel)   /* green border behind the bar for the selected row */
+            vita2d_draw_rectangle(SET_BAR_X - 2, ry + 5, SET_BAR_W + 4, 22,
+                                  COL_GREEN);
+        vita2d_draw_rectangle(SET_BAR_X, ry + 7, SET_BAR_W, 18, COL_BTN);
+        vita2d_draw_rectangle(SET_BAR_X, ry + 7,
+                              (int)(SET_BAR_W * g_vals[i]), 18, COL_RED);
+
+        snprintf(val, sizeof(val), "%.2f", g_vals[i]);
+        draw_text(2.0f, SET_VAL_X, ry + 9, COL_GREEN, val);
+    }
+
+    draw_button_sel(&settings_buttons[0], "SAVE",
+                    g_sel[SCR_SETTINGS] == SLIDER_COUNT);
+    draw_button_sel(&settings_buttons[1], "BACK",
+                    g_sel[SCR_SETTINGS] == SLIDER_COUNT + 1);
+
+    if (!g_vals_valid)
+        draw_text(2.0f, 640, 476, COL_TEXT, "NO DATA - REOPEN");
+}
+
 static void init_net(void)
 {
     SceNetInitParam param;
@@ -611,7 +824,9 @@ int main(void)
             g_lr_hold = 0;
         }
 
-        /* D-pad / left stick: move the selection, with repeat. */
+        /* D-pad / left stick: move the selection, with repeat.
+         * [NEW] On the settings screen, up/down picks a slider (or SAVE/
+         * BACK) and left/right nudges the selected value by 0.05. */
         dir = nav_direction(&pad);
         if (dir >= 0) {
             static const int ndx[4] = {-1, 1, 0, 0};
@@ -619,17 +834,44 @@ int main(void)
             g_nav_hold++;
             if (g_nav_hold == 1 ||
                 (g_nav_hold > NAV_DELAY_FRAMES &&
-                 ((g_nav_hold - NAV_DELAY_FRAMES) % NAV_REPEAT_FRAMES) == 0))
-                nav_move(g_screen, ndx[dir], ndy[dir]);
+                 ((g_nav_hold - NAV_DELAY_FRAMES) % NAV_REPEAT_FRAMES) == 0)) {
+                if (g_screen == SCR_SETTINGS) {
+                    int s = g_sel[SCR_SETTINGS];
+                    if (dir == 2 && s > 0)
+                        g_sel[SCR_SETTINGS] = s - 1;
+                    else if (dir == 3 && s < SET_ITEMS - 1)
+                        g_sel[SCR_SETTINGS] = s + 1;
+                    else if (dir == 0 && s < SLIDER_COUNT)
+                        g_vals[s] = clamp_val(g_vals[s] - SLIDER_STEP);
+                    else if (dir == 1 && s < SLIDER_COUNT)
+                        g_vals[s] = clamp_val(g_vals[s] + SLIDER_STEP);
+                } else {
+                    nav_move(g_screen, ndx[dir], ndy[dir]);
+                }
+            }
         } else {
             g_nav_hold = 0;
         }
 
-        /* X: activate the highlighted button. */
+        /* X: activate the highlighted button. [NEW] On the settings screen
+         * X only fires SAVE/BACK; sliders are adjusted with left/right. */
         if (pressed & SCE_CTRL_CROSS) {
-            const Button *btns = (g_screen == SCR_IP) ? ip_buttons
-                                                      : remote_buttons;
-            do_action(&btns[g_sel[g_screen]]);
+            if (g_screen == SCR_SETTINGS) {
+                int s = g_sel[SCR_SETTINGS];
+                if (s >= SLIDER_COUNT)
+                    do_action(&settings_buttons[s - SLIDER_COUNT]);
+            } else {
+                const Button *btns = (g_screen == SCR_IP) ? ip_buttons
+                                                          : remote_buttons;
+                do_action(&btns[g_sel[g_screen]]);
+            }
+        }
+
+        /* [NEW] O (circle): back out of settings without saving. */
+        if ((pressed & SCE_CTRL_CIRCLE) && g_screen == SCR_SETTINGS) {
+            g_screen = SCR_REMOTE;
+            g_sel[SCR_REMOTE] = REMOTE_SEL_DEFAULT;
+            set_status("SETTINGS NOT SAVED");
         }
 
         g_prev_pad = pad.buttons;
@@ -652,11 +894,13 @@ int main(void)
 
         if (g_screen == SCR_IP)
             draw_ip_screen();
+        else if (g_screen == SCR_SETTINGS)
+            draw_settings_screen();
         else
             draw_remote_screen();
 
         /* Raw last reply from the PC -- the ground truth for debugging. */
-        draw_text(2.0f, 16, 516, COL_GREEN, g_status);
+        draw_text(2.0f, 16, 524, COL_GREEN, g_status);
 
         vita2d_end_drawing();
         vita2d_swap_buffers();
