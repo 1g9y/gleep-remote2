@@ -148,7 +148,7 @@ void draw_text(float scale, int x, int y, unsigned int color, const char *text)
             unsigned char bits = g[col];
             for (row = 0; row < GLYPH_H; row++) {
                 if (bits & (1u << row)) {
-                    vita2d_draw_fill_rect(
+                    vita2d_draw_rectangle(
                         (float)(gx + (int)(col * scale)),
                         (float)(y + (int)(row * scale)),
                         scale, scale, color);
