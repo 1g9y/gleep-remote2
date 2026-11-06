@@ -238,8 +238,8 @@ static void touch_to_screen(int rx, int ry, int *sx, int *sy)
 static void draw_button(const Button *b)
 {
     int tw;
-    vita2d_draw_fill_rect((float)b->x, (float)b->y, (float)b->w, (float)b->h, COL_RED);
-    vita2d_draw_fill_rect((float)b->x + 2, (float)b->y + 2,
+    vita2d_draw_rectangle((float)b->x, (float)b->y, (float)b->w, (float)b->h, COL_RED);
+    vita2d_draw_rectangle((float)b->x + 2, (float)b->y + 2,
                           (float)b->w - 4, (float)b->h - 4, COL_BTN);
     tw = text_width(2.0f, b->label);
     draw_text(2.0f, b->x + (b->w - tw) / 2, b->y + (b->h - 14) / 2, COL_TEXT, b->label);
@@ -253,8 +253,8 @@ static void draw_ip_screen(void)
 
     draw_text(2.5f, 16, 24, COL_RED, "GLEEP REMOTE");
 
-    vita2d_draw_fill_rect(108, 52, 264, 30, COL_RED);
-    vita2d_draw_fill_rect(110, 54, 260, 26, COL_PANEL);
+    vita2d_draw_rectangle(108, 52, 264, 30, COL_RED);
+    vita2d_draw_rectangle(110, 54, 260, 26, COL_PANEL);
     snprintf(buf, sizeof(buf), "%s_", g_ip);
     tw = text_width(2.0f, buf);
     draw_text(2.0f, 108 + (264 - tw) / 2, 60, COL_GREEN, buf);
